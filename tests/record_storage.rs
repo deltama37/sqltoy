@@ -4,7 +4,9 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqltoy::{PageId, PageManager, RecordFile};
+use sqltoy::{PageId, PageManager, RecordFile, TableId};
+
+const TABLE: TableId = TableId(2);
 
 #[test]
 fn records_persist_after_reopen() {
@@ -15,25 +17,25 @@ fn records_persist_after_reopen() {
     let bob;
     {
         let mut records = RecordFile::open(&path).expect("open");
-        alice = records.insert(b"Alice").expect("insert alice");
-        bob = records.insert(b"Bob").expect("insert bob");
-        records.update(alice, b"Alicia").expect("update");
-        records.delete(bob).expect("delete");
+        alice = records.insert(TABLE, b"Alice").expect("insert alice");
+        bob = records.insert(TABLE, b"Bob").expect("insert bob");
+        records.update(TABLE, alice, b"Alicia").expect("update");
+        records.delete(TABLE, bob).expect("delete");
     }
 
     let mut records = RecordFile::open(&path).expect("reopen");
-    assert_eq!(records.get(alice).expect("get"), b"Alicia");
-    let missing = records.get(bob).expect_err("deleted");
+    assert_eq!(records.get(TABLE, alice).expect("get"), b"Alicia");
+    let missing = records.get(TABLE, bob).expect_err("deleted");
     assert_eq!(missing.kind(), ErrorKind::NotFound);
     assert_eq!(missing.to_string(), format!("record not found: {bob}"));
     assert_eq!(
-        records.scan().expect("scan"),
+        records.scan(TABLE).expect("scan"),
         vec![(alice, b"Alicia".to_vec())]
     );
     drop(records);
 
     let mut pages = PageManager::open(&path).expect("pages");
-    assert_eq!(pages.format_version().expect("version"), 1);
+    assert_eq!(pages.format_version().expect("version"), 2);
 }
 
 #[test]
@@ -47,7 +49,7 @@ fn records_spill_across_pages() {
         let mut records = RecordFile::open(&path).expect("open");
         ids = payloads
             .iter()
-            .map(|bytes| records.insert(bytes).expect("insert"))
+            .map(|bytes| records.insert(TABLE, bytes).expect("insert"))
             .collect::<Vec<_>>();
         assert!(ids.iter().any(|id| id.page_id.0 > 1));
         assert!(ids.iter().any(|id| id.page_id == PageId(1)));
@@ -55,9 +57,9 @@ fn records_spill_across_pages() {
 
     let mut records = RecordFile::open(&path).expect("reopen");
     for (id, payload) in ids.iter().zip(&payloads) {
-        assert_eq!(records.get(*id).expect("get"), *payload);
+        assert_eq!(records.get(TABLE, *id).expect("get"), *payload);
     }
-    let scanned = records.scan().expect("scan");
+    let scanned = records.scan(TABLE).expect("scan");
     assert_eq!(scanned.len(), payloads.len());
     for (got, (expected_id, expected_bytes)) in scanned.iter().zip(ids.iter().zip(&payloads)) {
         assert_eq!(got.0, *expected_id);
@@ -73,24 +75,54 @@ fn deleted_space_is_reused() {
     let mut records = RecordFile::open(&path).expect("open");
     let mut ids = Vec::new();
     for i in 0u8..4 {
-        ids.push(records.insert(&[i; 1000]).expect("insert"));
+        ids.push(records.insert(TABLE, &[i; 1000]).expect("insert"));
     }
     assert!(ids.iter().all(|id| id.page_id == PageId(1)));
 
-    records.delete(ids[0]).expect("delete first");
-    records.delete(ids[2]).expect("delete third");
-    let reused = records.insert(&[9u8; 1000]).expect("reuse");
+    records.delete(TABLE, ids[0]).expect("delete first");
+    records.delete(TABLE, ids[2]).expect("delete third");
+    let reused = records.insert(TABLE, &[9u8; 1000]).expect("reuse");
     assert_eq!(reused.page_id, PageId(1));
     assert_eq!(reused.slot_id, ids[0].slot_id);
-    assert_eq!(records.get(reused).expect("reused"), vec![9u8; 1000]);
-    assert_eq!(records.get(ids[1]).expect("kept"), vec![1u8; 1000]);
-    assert_eq!(records.get(ids[3]).expect("kept"), vec![3u8; 1000]);
-    let missing = records.get(ids[2]).expect_err("still deleted");
+    assert_eq!(records.get(TABLE, reused).expect("reused"), vec![9u8; 1000]);
+    assert_eq!(records.get(TABLE, ids[1]).expect("kept"), vec![1u8; 1000]);
+    assert_eq!(records.get(TABLE, ids[3]).expect("kept"), vec![3u8; 1000]);
+    let missing = records.get(TABLE, ids[2]).expect_err("still deleted");
     assert_eq!(missing.kind(), ErrorKind::NotFound);
     drop(records);
 
     let pages = PageManager::open(&path).expect("pages");
     assert_eq!(pages.page_count().expect("count"), 2);
+}
+
+#[test]
+fn table_scans_stay_separate_after_reopen() {
+    let path = unique_temp_path("tables");
+    let _cleanup = TempFile(&path);
+    let users = TableId(2);
+    let posts = TableId(3);
+
+    let alice;
+    let post;
+    {
+        let mut records = RecordFile::open(&path).expect("open");
+        alice = records.insert(users, b"Alice").expect("alice");
+        post = records.insert(posts, b"hi").expect("post");
+        assert_ne!(alice.page_id, post.page_id);
+    }
+
+    let mut records = RecordFile::open(&path).expect("reopen");
+    assert_eq!(
+        records.scan(users).expect("users"),
+        vec![(alice, b"Alice".to_vec())]
+    );
+    assert_eq!(
+        records.scan(posts).expect("posts"),
+        vec![(post, b"hi".to_vec())]
+    );
+    let missing = records.get(posts, alice).expect_err("wrong table");
+    assert_eq!(missing.kind(), ErrorKind::NotFound);
+    assert_eq!(missing.to_string(), format!("record not found: {alice}"));
 }
 
 fn unique_temp_path(label: &str) -> PathBuf {

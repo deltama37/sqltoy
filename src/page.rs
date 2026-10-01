@@ -13,7 +13,7 @@ use crate::storage::Storage;
 pub const PAGE_SIZE: usize = 4096;
 
 const MAGIC: &[u8; 8] = b"SQLTOYDB";
-const FORMAT_VERSION: u32 = 1;
+const FORMAT_VERSION: u32 = 2;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
@@ -82,8 +82,8 @@ impl PageManager {
     /// Opens the database at `path`.
     ///
     /// An empty file is initialized with a header page and synced. An existing
-    /// file must carry the sqltoy magic and this build's page size, and its
-    /// length must be a positive multiple of [`PAGE_SIZE`].
+    /// file must carry the sqltoy magic, format version 2, and this build's
+    /// page size, and its length must be a positive multiple of [`PAGE_SIZE`].
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<PageManager> {
         let mut storage = Storage::open(path)?;
         if storage.is_empty()? {
@@ -188,6 +188,14 @@ fn validate_existing(storage: &mut Storage) -> io::Result<()> {
             format!("unsupported page size: {stored_page_size}"),
         ));
     }
+
+    let version = read_u32_le(&header[VERSION_OFFSET..VERSION_OFFSET + 4]);
+    if version != FORMAT_VERSION {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            format!("unsupported format version: {version}"),
+        ));
+    }
     Ok(())
 }
 
@@ -241,11 +249,11 @@ mod tests {
         let mut pages = PageManager::open(db.path()).unwrap();
 
         assert_eq!(pages.page_count().unwrap(), 1);
-        assert_eq!(pages.format_version().unwrap(), 1);
+        assert_eq!(pages.format_version().unwrap(), 2);
 
         let header = pages.read_page(PageId(0)).unwrap();
         assert_eq!(&header.data()[..8], b"SQLTOYDB");
-        assert_eq!(&header.data()[8..12], &1u32.to_le_bytes());
+        assert_eq!(&header.data()[8..12], &2u32.to_le_bytes());
         assert_eq!(&header.data()[12..16], &(PAGE_SIZE as u32).to_le_bytes());
         assert!(header.data()[16..].iter().all(|byte| *byte == 0));
     }
@@ -320,6 +328,7 @@ mod tests {
             let mut storage = Storage::open(db.path()).unwrap();
             let mut bytes = vec![0u8; PAGE_SIZE];
             bytes[..8].copy_from_slice(b"SQLTOYDB");
+            // Not version 2. Page size is checked before the version.
             bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
             bytes[12..16].copy_from_slice(&512u32.to_le_bytes());
             storage.write_at(0, &bytes).unwrap();
@@ -329,6 +338,24 @@ mod tests {
         let err = error_of(PageManager::open(db.path()));
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "unsupported page size: 512");
+    }
+
+    #[test]
+    fn unsupported_format_version_is_rejected() {
+        let db = TempDb::new("badver");
+        {
+            let mut storage = Storage::open(db.path()).unwrap();
+            let mut bytes = vec![0u8; PAGE_SIZE];
+            bytes[..8].copy_from_slice(b"SQLTOYDB");
+            bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+            bytes[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+            storage.write_at(0, &bytes).unwrap();
+            storage.sync().unwrap();
+        }
+
+        let err = error_of(PageManager::open(db.path()));
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "unsupported format version: 1");
     }
 
     #[test]

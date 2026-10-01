@@ -2,11 +2,13 @@
 //!
 //! Record bytes are packed from the end of the page. A slot directory at the
 //! front points at those bytes, so compaction can move a record without
-//! changing its slot id. This module does not read or write the database file.
+//! changing its slot id. The page header records which table owns the page.
+//! This module does not read or write the database file.
 
 use std::io::{self, ErrorKind};
 
 use crate::page::{Page, PageId, PAGE_SIZE};
+use crate::record::TableId;
 
 /// Byte at the start of a record page.
 const PAGE_TYPE_RECORD: u8 = 1;
@@ -17,6 +19,7 @@ const SLOT_LEN: usize = 4;
 const PAGE_TYPE_OFFSET: usize = 0;
 const SLOT_COUNT_OFFSET: usize = 2;
 const FREE_END_OFFSET: usize = 4;
+const OWNER_OFFSET: usize = 6;
 
 /// Maximum record length in bytes (`4096 - 8 - 4`).
 pub const MAX_RECORD_SIZE: usize = PAGE_SIZE - HEADER_LEN - SLOT_LEN;
@@ -27,13 +30,17 @@ pub struct SlottedPage {
 }
 
 impl SlottedPage {
-    /// An empty record page (`slot_count = 0`, `free_end = 4096`).
-    pub fn init() -> SlottedPage {
+    /// An empty record page owned by `owner` (`slot_count = 0`, `free_end = 4096`).
+    pub fn init(owner: TableId) -> SlottedPage {
         let mut page = Page::zeroed();
         page.data_mut()[PAGE_TYPE_OFFSET] = PAGE_TYPE_RECORD;
         write_u16_le(
             &mut page.data_mut()[FREE_END_OFFSET..FREE_END_OFFSET + 2],
             PAGE_SIZE as u16,
+        );
+        write_u16_le(
+            &mut page.data_mut()[OWNER_OFFSET..OWNER_OFFSET + 2],
+            owner.0,
         );
         SlottedPage { page }
     }
@@ -41,7 +48,8 @@ impl SlottedPage {
     /// Interprets `page` as a record page.
     ///
     /// Fails with [`ErrorKind::InvalidData`] when the page type byte is not a
-    /// record page, or when the slot directory and record offsets disagree.
+    /// record page, when the owner table id is 0, or when the slot directory
+    /// and record offsets disagree.
     pub fn from_page(page_id: PageId, page: Page) -> io::Result<SlottedPage> {
         if page.data().first().copied() != Some(PAGE_TYPE_RECORD) {
             return Err(io::Error::new(
@@ -62,6 +70,13 @@ impl SlottedPage {
     /// Unwraps the underlying page.
     pub fn into_page(self) -> Page {
         self.page
+    }
+
+    /// Table that owns this page.
+    pub fn owner(&self) -> TableId {
+        TableId(read_u16_le(
+            &self.page.data()[OWNER_OFFSET..OWNER_OFFSET + 2],
+        ))
     }
 
     /// Number of slots, including tombstones.
@@ -213,6 +228,9 @@ impl SlottedPage {
     }
 
     fn check_layout(&self, page_id: PageId) -> io::Result<()> {
+        if self.owner() == TableId(0) {
+            return Err(invalid_page(page_id));
+        }
         let count = self.slot_count();
         let start = HEADER_LEN + count as usize * SLOT_LEN;
         if start > PAGE_SIZE {
@@ -360,6 +378,7 @@ fn write_u16_le(dest: &mut [u8], value: u16) {
 mod tests {
     use super::{SlottedPage, MAX_RECORD_SIZE};
     use crate::page::{Page, PageId, PAGE_SIZE};
+    use crate::record::TableId;
     use std::io::ErrorKind;
 
     fn reload(page: SlottedPage) -> SlottedPage {
@@ -368,13 +387,14 @@ mod tests {
 
     #[test]
     fn init_layout_is_header_only() {
-        let page = SlottedPage::init();
+        let page = SlottedPage::init(TableId(2));
         let bytes = page.page().data();
         assert_eq!(bytes[0], 1);
         assert_eq!(bytes[1], 0);
         assert_eq!(&bytes[2..4], &0u16.to_le_bytes());
         assert_eq!(&bytes[4..6], &4096u16.to_le_bytes());
-        assert_eq!(&bytes[6..8], &0u16.to_le_bytes());
+        assert_eq!(&bytes[6..8], &2u16.to_le_bytes());
+        assert_eq!(page.owner(), TableId(2));
         assert!(bytes[8..].iter().all(|byte| *byte == 0));
         assert_eq!(page.slot_count(), 0);
         assert_eq!(page.free_space(), PAGE_SIZE - 8);
@@ -383,7 +403,7 @@ mod tests {
 
     #[test]
     fn insert_and_get_roundtrip_layout() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         let slot = page.insert(b"ab").unwrap();
         assert_eq!(slot, 0);
         assert_eq!(page.get(0).unwrap(), b"ab");
@@ -401,7 +421,7 @@ mod tests {
 
     #[test]
     fn many_inserts_fill_the_page() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         let mut count = 0u16;
         while let Some(slot) = page.insert(&[0x5A]) {
             assert_eq!(slot, count);
@@ -421,7 +441,7 @@ mod tests {
 
     #[test]
     fn tombstone_reuse_picks_the_lowest_slot() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         assert_eq!(page.insert(b"a").unwrap(), 0);
         assert_eq!(page.insert(b"b").unwrap(), 1);
         assert_eq!(page.insert(b"c").unwrap(), 2);
@@ -444,7 +464,7 @@ mod tests {
 
     #[test]
     fn compaction_preserves_slot_ids_and_data() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         page.insert(b"alpha").unwrap();
         page.insert(b"beta").unwrap();
         page.insert(b"gamma").unwrap();
@@ -471,7 +491,7 @@ mod tests {
 
     #[test]
     fn insert_succeeds_only_after_compaction() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         page.insert(&[1u8; 1000]).unwrap();
         page.insert(&[2u8; 1000]).unwrap();
         page.insert(&[3u8; 1000]).unwrap();
@@ -498,7 +518,7 @@ mod tests {
 
     #[test]
     fn update_shrink_grow_and_reject() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         page.insert(b"hello").unwrap();
         let (offset, len) = page.read_slot(0);
         assert_eq!((offset, len), (4091, 5));
@@ -525,7 +545,7 @@ mod tests {
         assert!(page.get(2).is_none());
         assert_eq!(page.get(3).unwrap(), &[3u8; 1000]);
 
-        let mut packed = SlottedPage::init();
+        let mut packed = SlottedPage::init(TableId(2));
         packed.insert(&[1u8; 2000]).unwrap();
         packed.insert(&[2u8; 2000]).unwrap();
         let before = packed.page().data().to_vec();
@@ -543,7 +563,7 @@ mod tests {
 
     #[test]
     fn zero_length_record_survives_compaction() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         assert_eq!(page.insert(b"").unwrap(), 0);
         assert_eq!(page.get(0).unwrap(), b"");
         let (offset, len) = page.read_slot(0);
@@ -573,7 +593,7 @@ mod tests {
 
     #[test]
     fn max_record_fills_an_empty_page() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         let record = vec![0xABu8; MAX_RECORD_SIZE];
         assert_eq!(MAX_RECORD_SIZE, 4084);
         let slot = page.insert(&record).unwrap();
@@ -590,7 +610,7 @@ mod tests {
 
     #[test]
     fn oversized_record_is_rejected() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         let before = page.page().data().to_vec();
         assert!(page.insert(&[0u8; MAX_RECORD_SIZE + 1]).is_none());
         assert_eq!(page.page().data(), before.as_slice());
@@ -611,7 +631,7 @@ mod tests {
 
     #[test]
     fn missing_slot_is_not_found() {
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         page.insert(b"a").unwrap();
         page.delete(0).unwrap();
 
@@ -649,6 +669,30 @@ mod tests {
     }
 
     #[test]
+    fn owner_zero_is_rejected() {
+        let mut page = SlottedPage::init(TableId(2)).into_page();
+        page.data_mut()[6] = 0;
+        page.data_mut()[7] = 0;
+        let err = error_of(SlottedPage::from_page(PageId(8), page));
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "invalid record page: 8");
+
+        let mut page = Page::zeroed();
+        page.data_mut()[0] = 1;
+        page.data_mut()[4..6].copy_from_slice(&4096u16.to_le_bytes());
+        let err = error_of(SlottedPage::from_page(PageId(9), page));
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "invalid record page: 9");
+
+        // The type byte is checked before the owner. This page's owner is 0.
+        let mut page = Page::zeroed();
+        page.data_mut()[0] = 2;
+        let err = error_of(SlottedPage::from_page(PageId(3), page));
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+        assert_eq!(err.to_string(), "not a record page: 3");
+    }
+
+    #[test]
     fn random_operations_match_a_model() {
         let mut seed = 0x2545_F491_4F6C_DD1Du64;
         let mut next = move |bound: usize| {
@@ -658,7 +702,7 @@ mod tests {
             (seed % bound as u64) as usize
         };
 
-        let mut page = SlottedPage::init();
+        let mut page = SlottedPage::init(TableId(2));
         let mut model: Vec<Option<Vec<u8>>> = Vec::new();
         for step in 0..20_000 {
             let len = next(600);

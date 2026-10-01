@@ -8,6 +8,7 @@ are in `docs/adr/`:
 - ADR-0002 fixes a bottom-up implementation order.
 - ADR-0003 fixes the page size and the header page format.
 - ADR-0004 fixes the slotted-page record format.
+- ADR-0005 fixes table page ownership and the catalog record format.
 
 ## Status
 
@@ -16,7 +17,10 @@ offset. The Page Manager (ADR-0002 step 2, per ADR-0003) is implemented on
 top of Storage: fixed 4096-byte pages, a reserved header page (page 0), and
 allocate/read/write of pages with persistence. Record Storage (ADR-0002
 step 3, per ADR-0004) stores variable-length records in slotted pages and
-addresses them with stable record ids. SQL is not implemented yet.
+addresses them with stable record ids. Each record page belongs to one table.
+The Catalog (ADR-0002 step 4, per ADR-0005) is done: table schemas are stored
+in the database file and restored when the file is opened. The header format
+version is 2. Table Operations and SQL are not implemented yet.
 
 ## Build and test
 
@@ -66,19 +70,25 @@ hello-page
 ## Record CLI
 
 ```bash
-cargo run --quiet -- rec-insert /tmp/records.db "Alice"
-cargo run --quiet -- rec-insert /tmp/records.db "Bob"
-cargo run --quiet -- rec-get /tmp/records.db 1:0
-cargo run --quiet -- rec-update /tmp/records.db 1:0 "Alicia"
-cargo run --quiet -- rec-scan /tmp/records.db
-cargo run --quiet -- rec-delete /tmp/records.db 1:1
-cargo run --quiet -- rec-scan /tmp/records.db
+cargo run --quiet -- rec-insert /tmp/records.db 2 "Alice"
+cargo run --quiet -- rec-insert /tmp/records.db 2 "Bob"
+cargo run --quiet -- rec-get /tmp/records.db 2 1:0
+cargo run --quiet -- rec-update /tmp/records.db 2 1:0 "Alicia"
+cargo run --quiet -- rec-scan /tmp/records.db 2
+cargo run --quiet -- rec-delete /tmp/records.db 2 1:1
+cargo run --quiet -- rec-scan /tmp/records.db 2
 ```
+
+`rec-*` is a low-level tool. It reads and writes record pages directly and
+does not consult the catalog. The argument after the database path is the
+table id that owns those pages. User tables start at id 2; the examples use
+that id.
 
 `rec-insert` appends a record and prints its id (`page:slot`). `rec-get` prints
 the stored bytes as text. `rec-update` and `rec-delete` keep that same id.
-`rec-scan` prints each live record in page order, then slot order. Each command
-is a new process; a later `rec-scan` shows the update and the delete:
+`rec-scan` prints each live record of that table in page order, then slot
+order. Each command is a new process; a later `rec-scan` shows the update and
+the delete:
 
 ```text
 inserted record 1:0
@@ -89,4 +99,24 @@ updated record 1:0
 1:1 Bob
 deleted record 1:1
 1:0 Alicia
+```
+
+## Catalog CLI
+
+```bash
+cargo run --quiet -- table-create /tmp/catalog.db users id:INTEGER name:TEXT
+cargo run --quiet -- table-create /tmp/catalog.db posts id:INTEGER title:TEXT
+cargo run --quiet -- table-list /tmp/catalog.db
+```
+
+`table-create` checks the name and the `column:type` pairs, assigns the next
+user-table id, writes one catalog record, and syncs. `table-list` below is a
+new process; it prints the schemas loaded back from the file, in table-id
+order:
+
+```text
+created table users (id 2)
+created table posts (id 3)
+2 users (id INTEGER, name TEXT)
+3 posts (id INTEGER, title TEXT)
 ```

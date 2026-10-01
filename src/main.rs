@@ -2,7 +2,9 @@ use std::env;
 use std::io;
 use std::process::ExitCode;
 
-use sqltoy::{PageId, PageManager, RecordFile, RecordId, Storage, PAGE_SIZE};
+use sqltoy::{
+    ColumnType, Database, PageId, PageManager, RecordFile, RecordId, Storage, TableId, PAGE_SIZE,
+};
 
 const USAGE: &str = "\
 usage: sqltoy <command> [args]
@@ -15,11 +17,13 @@ commands:
   sqltoy page-alloc <db_path>
   sqltoy page-write <db_path> <page_id> <text>
   sqltoy page-read <db_path> <page_id> <len>
-  sqltoy rec-insert <db_path> <text>
-  sqltoy rec-get <db_path> <record_id>
-  sqltoy rec-update <db_path> <record_id> <text>
-  sqltoy rec-delete <db_path> <record_id>
-  sqltoy rec-scan <db_path>
+  sqltoy rec-insert <db_path> <table_id> <text>
+  sqltoy rec-get <db_path> <table_id> <record_id>
+  sqltoy rec-update <db_path> <table_id> <record_id> <text>
+  sqltoy rec-delete <db_path> <table_id> <record_id>
+  sqltoy rec-scan <db_path> <table_id>
+  sqltoy table-create <db_path> <name> <column:type>...
+  sqltoy table-list <db_path>
 ";
 
 fn main() -> ExitCode {
@@ -79,24 +83,32 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
             cmd_page_read(path, page_id, len)?;
             Ok(())
         }
-        [cmd, path, text] if cmd == "rec-insert" => {
-            cmd_rec_insert(path, text)?;
+        [cmd, path, table_id, text] if cmd == "rec-insert" => {
+            cmd_rec_insert(path, table_id, text)?;
             Ok(())
         }
-        [cmd, path, record_id] if cmd == "rec-get" => {
-            cmd_rec_get(path, record_id)?;
+        [cmd, path, table_id, record_id] if cmd == "rec-get" => {
+            cmd_rec_get(path, table_id, record_id)?;
             Ok(())
         }
-        [cmd, path, record_id, text] if cmd == "rec-update" => {
-            cmd_rec_update(path, record_id, text)?;
+        [cmd, path, table_id, record_id, text] if cmd == "rec-update" => {
+            cmd_rec_update(path, table_id, record_id, text)?;
             Ok(())
         }
-        [cmd, path, record_id] if cmd == "rec-delete" => {
-            cmd_rec_delete(path, record_id)?;
+        [cmd, path, table_id, record_id] if cmd == "rec-delete" => {
+            cmd_rec_delete(path, table_id, record_id)?;
             Ok(())
         }
-        [cmd, path] if cmd == "rec-scan" => {
-            cmd_rec_scan(path)?;
+        [cmd, path, table_id] if cmd == "rec-scan" => {
+            cmd_rec_scan(path, table_id)?;
+            Ok(())
+        }
+        [cmd, path, name, columns @ ..] if cmd == "table-create" && !columns.is_empty() => {
+            cmd_table_create(path, name, columns)?;
+            Ok(())
+        }
+        [cmd, path] if cmd == "table-list" => {
+            cmd_table_list(path)?;
             Ok(())
         }
         _ => Err(CliError::Usage),
@@ -174,43 +186,99 @@ fn cmd_page_read(path: &str, page_id: &str, len: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn cmd_rec_insert(path: &str, text: &str) -> io::Result<()> {
+fn cmd_rec_insert(path: &str, table_id: &str, text: &str) -> io::Result<()> {
+    let table = parse_table_id(table_id)?;
     let mut records = RecordFile::open(path)?;
-    let id = records.insert(text.as_bytes())?;
+    let id = records.insert(table, text.as_bytes())?;
     println!("inserted record {id}");
     Ok(())
 }
 
-fn cmd_rec_get(path: &str, record_id: &str) -> io::Result<()> {
+fn cmd_rec_get(path: &str, table_id: &str, record_id: &str) -> io::Result<()> {
+    let table = parse_table_id(table_id)?;
     let id = parse_record_id(record_id)?;
     let mut records = RecordFile::open(path)?;
-    let bytes = records.get(id)?;
+    let bytes = records.get(table, id)?;
     println!("{}", String::from_utf8_lossy(&bytes));
     Ok(())
 }
 
-fn cmd_rec_update(path: &str, record_id: &str, text: &str) -> io::Result<()> {
+fn cmd_rec_update(path: &str, table_id: &str, record_id: &str, text: &str) -> io::Result<()> {
+    let table = parse_table_id(table_id)?;
     let id = parse_record_id(record_id)?;
     let mut records = RecordFile::open(path)?;
-    records.update(id, text.as_bytes())?;
+    records.update(table, id, text.as_bytes())?;
     println!("updated record {id}");
     Ok(())
 }
 
-fn cmd_rec_delete(path: &str, record_id: &str) -> io::Result<()> {
+fn cmd_rec_delete(path: &str, table_id: &str, record_id: &str) -> io::Result<()> {
+    let table = parse_table_id(table_id)?;
     let id = parse_record_id(record_id)?;
     let mut records = RecordFile::open(path)?;
-    records.delete(id)?;
+    records.delete(table, id)?;
     println!("deleted record {id}");
     Ok(())
 }
 
-fn cmd_rec_scan(path: &str) -> io::Result<()> {
+fn cmd_rec_scan(path: &str, table_id: &str) -> io::Result<()> {
+    let table = parse_table_id(table_id)?;
     let mut records = RecordFile::open(path)?;
-    for (id, bytes) in records.scan()? {
+    for (id, bytes) in records.scan(table)? {
         println!("{id} {}", String::from_utf8_lossy(&bytes));
     }
     Ok(())
+}
+
+fn cmd_table_create(path: &str, name: &str, columns: &[String]) -> io::Result<()> {
+    let mut parsed = Vec::with_capacity(columns.len());
+    for raw in columns {
+        parsed.push(parse_column_def(raw)?);
+    }
+    let mut db = Database::open(path)?;
+    let schema = db.create_table(name, &parsed)?;
+    println!("created table {} (id {})", schema.name, schema.id);
+    Ok(())
+}
+
+fn cmd_table_list(path: &str) -> io::Result<()> {
+    let db = Database::open(path)?;
+    for table in db.tables() {
+        let columns = table
+            .columns
+            .iter()
+            .map(|column| format!("{} {}", column.name, column.column_type))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("{} {} ({columns})", table.id, table.name);
+    }
+    Ok(())
+}
+
+fn parse_column_def(raw: &str) -> io::Result<(&str, ColumnType)> {
+    let invalid = || {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid column definition: {raw}"),
+        )
+    };
+    let Some((name, ty)) = raw.split_once(':') else {
+        return Err(invalid());
+    };
+    if name.is_empty() || ty.is_empty() || ty.contains(':') {
+        return Err(invalid());
+    }
+    let column_type = ty.parse()?;
+    Ok((name, column_type))
+}
+
+fn parse_table_id(raw: &str) -> io::Result<TableId> {
+    raw.parse::<u16>().map(TableId).map_err(|_| {
+        io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!("invalid table id: {raw}"),
+        )
+    })
 }
 
 fn parse_record_id(raw: &str) -> io::Result<RecordId> {
