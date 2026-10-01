@@ -9,6 +9,7 @@ are in `docs/adr/`:
 - ADR-0003 fixes the page size and the header page format.
 - ADR-0004 fixes the slotted-page record format.
 - ADR-0005 fixes table page ownership and the catalog record format.
+- ADR-0006 fixes row encoding and table operations.
 
 ## Status
 
@@ -20,7 +21,10 @@ step 3, per ADR-0004) stores variable-length records in slotted pages and
 addresses them with stable record ids. Each record page belongs to one table.
 The Catalog (ADR-0002 step 4, per ADR-0005) is done: table schemas are stored
 in the database file and restored when the file is opened. The header format
-version is 2. Table Operations and SQL are not implemented yet.
+version is 2. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
+typed rows, including NULL, can be inserted, scanned, updated, and deleted.
+An update that no longer fits on its page is stored at a new record id. SQL
+is not implemented yet.
 
 ## Build and test
 
@@ -119,4 +123,38 @@ created table users (id 2)
 created table posts (id 3)
 2 users (id INTEGER, name TEXT)
 3 posts (id INTEGER, title TEXT)
+```
+
+## Row CLI
+
+```bash
+cargo run --quiet -- table-create /tmp/rows.db users id:INTEGER name:TEXT age:INTEGER
+cargo run --quiet -- row-insert /tmp/rows.db users 1 Alice 30
+cargo run --quiet -- row-insert /tmp/rows.db users 2 Bob NULL
+cargo run --quiet -- row-scan /tmp/rows.db users
+cargo run --quiet -- row-update /tmp/rows.db users 2:0 1 Alicia 31
+cargo run --quiet -- row-delete /tmp/rows.db users 2:1
+cargo run --quiet -- row-scan /tmp/rows.db users
+```
+
+`row-insert` checks the values against the table's columns and prints the new
+record id (`page:slot`). `NULL`, in any ASCII case, is a null. Other values
+for an `INTEGER` column are parsed as decimal `i64` values, and a `TEXT`
+column stores the argument as given. Because `NULL` is reserved, the CLI
+cannot store that word as text. `row-scan` prints each live row. Text is
+shown in single quotes, and a quote inside the text is doubled. `row-update`
+replaces the whole row. The id stays the same when the new row fits on its
+page; when it does not, the line includes the new id
+(`updated row 2:0 -> 3:0`). `row-delete` removes one row. Each command is a
+new process. The last `row-scan` shows the update and the delete:
+
+```text
+created table users (id 2)
+inserted row 2:0
+inserted row 2:1
+2:0 (1, 'Alice', 30)
+2:1 (2, 'Bob', NULL)
+updated row 2:0
+deleted row 2:1
+2:0 (1, 'Alicia', 31)
 ```

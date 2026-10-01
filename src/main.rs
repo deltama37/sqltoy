@@ -3,7 +3,8 @@ use std::io;
 use std::process::ExitCode;
 
 use sqltoy::{
-    ColumnType, Database, PageId, PageManager, RecordFile, RecordId, Storage, TableId, PAGE_SIZE,
+    Column, ColumnType, Database, PageId, PageManager, RecordFile, RecordId, Storage, TableId,
+    Value, PAGE_SIZE,
 };
 
 const USAGE: &str = "\
@@ -24,6 +25,10 @@ commands:
   sqltoy rec-scan <db_path> <table_id>
   sqltoy table-create <db_path> <name> <column:type>...
   sqltoy table-list <db_path>
+  sqltoy row-insert <db_path> <table> <value>...
+  sqltoy row-scan <db_path> <table>
+  sqltoy row-update <db_path> <table> <record_id> <value>...
+  sqltoy row-delete <db_path> <table> <record_id>
 ";
 
 fn main() -> ExitCode {
@@ -109,6 +114,22 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         }
         [cmd, path] if cmd == "table-list" => {
             cmd_table_list(path)?;
+            Ok(())
+        }
+        [cmd, path, table, values @ ..] if cmd == "row-insert" && !values.is_empty() => {
+            cmd_row_insert(path, table, values)?;
+            Ok(())
+        }
+        [cmd, path, table] if cmd == "row-scan" => {
+            cmd_row_scan(path, table)?;
+            Ok(())
+        }
+        [cmd, path, table, record_id, values @ ..] if cmd == "row-update" && !values.is_empty() => {
+            cmd_row_update(path, table, record_id, values)?;
+            Ok(())
+        }
+        [cmd, path, table, record_id] if cmd == "row-delete" => {
+            cmd_row_delete(path, table, record_id)?;
             Ok(())
         }
         _ => Err(CliError::Usage),
@@ -253,6 +274,96 @@ fn cmd_table_list(path: &str) -> io::Result<()> {
         println!("{} {} ({columns})", table.id, table.name);
     }
     Ok(())
+}
+
+fn cmd_row_insert(path: &str, table: &str, raw_values: &[String]) -> io::Result<()> {
+    let mut db = Database::open(path)?;
+    let values = parse_row_values(&db, table, raw_values)?;
+    let id = db.insert(table, &values)?;
+    println!("inserted row {id}");
+    Ok(())
+}
+
+fn cmd_row_scan(path: &str, table: &str) -> io::Result<()> {
+    let mut db = Database::open(path)?;
+    for (id, values) in db.scan(table)? {
+        println!("{id} {}", format_values(&values));
+    }
+    Ok(())
+}
+
+fn cmd_row_update(
+    path: &str,
+    table: &str,
+    record_id: &str,
+    raw_values: &[String],
+) -> io::Result<()> {
+    let id = parse_record_id(record_id)?;
+    let mut db = Database::open(path)?;
+    let values = parse_row_values(&db, table, raw_values)?;
+    let new_id = db.update(table, id, &values)?;
+    if new_id == id {
+        println!("updated row {id}");
+    } else {
+        println!("updated row {id} -> {new_id}");
+    }
+    Ok(())
+}
+
+fn cmd_row_delete(path: &str, table: &str, record_id: &str) -> io::Result<()> {
+    let id = parse_record_id(record_id)?;
+    let mut db = Database::open(path)?;
+    db.delete(table, id)?;
+    println!("deleted row {id}");
+    Ok(())
+}
+
+fn parse_row_values(db: &Database, table: &str, raw_values: &[String]) -> io::Result<Vec<Value>> {
+    let schema = db.table(table).ok_or_else(|| table_not_found(table))?;
+    if raw_values.len() != schema.columns.len() {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidInput,
+            format!(
+                "expected {} values for table {}, got {}",
+                schema.columns.len(),
+                schema.name,
+                raw_values.len()
+            ),
+        ));
+    }
+    let mut values = Vec::with_capacity(raw_values.len());
+    for (column, raw) in schema.columns.iter().zip(raw_values) {
+        values.push(parse_value(column, raw)?);
+    }
+    Ok(values)
+}
+
+fn parse_value(column: &Column, raw: &str) -> io::Result<Value> {
+    if raw.eq_ignore_ascii_case("null") {
+        return Ok(Value::Null);
+    }
+    match column.column_type {
+        ColumnType::Integer => raw.parse::<i64>().map(Value::Integer).map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("invalid integer for column {}: {raw}", column.name),
+            )
+        }),
+        ColumnType::Text => Ok(Value::Text(raw.to_string())),
+    }
+}
+
+fn format_values(values: &[Value]) -> String {
+    let body = values
+        .iter()
+        .map(ToString::to_string)
+        .collect::<Vec<_>>()
+        .join(", ");
+    format!("({body})")
+}
+
+fn table_not_found(name: &str) -> io::Error {
+    io::Error::new(io::ErrorKind::NotFound, format!("table not found: {name}"))
 }
 
 fn parse_column_def(raw: &str) -> io::Result<(&str, ColumnType)> {
