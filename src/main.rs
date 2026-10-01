@@ -2,7 +2,7 @@ use std::env;
 use std::io;
 use std::process::ExitCode;
 
-use sqltoy::{PageId, PageManager, Storage, PAGE_SIZE};
+use sqltoy::{PageId, PageManager, RecordFile, RecordId, Storage, PAGE_SIZE};
 
 const USAGE: &str = "\
 usage: sqltoy <command> [args]
@@ -15,6 +15,11 @@ commands:
   sqltoy page-alloc <db_path>
   sqltoy page-write <db_path> <page_id> <text>
   sqltoy page-read <db_path> <page_id> <len>
+  sqltoy rec-insert <db_path> <text>
+  sqltoy rec-get <db_path> <record_id>
+  sqltoy rec-update <db_path> <record_id> <text>
+  sqltoy rec-delete <db_path> <record_id>
+  sqltoy rec-scan <db_path>
 ";
 
 fn main() -> ExitCode {
@@ -72,6 +77,26 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         }
         [cmd, path, page_id, len] if cmd == "page-read" => {
             cmd_page_read(path, page_id, len)?;
+            Ok(())
+        }
+        [cmd, path, text] if cmd == "rec-insert" => {
+            cmd_rec_insert(path, text)?;
+            Ok(())
+        }
+        [cmd, path, record_id] if cmd == "rec-get" => {
+            cmd_rec_get(path, record_id)?;
+            Ok(())
+        }
+        [cmd, path, record_id, text] if cmd == "rec-update" => {
+            cmd_rec_update(path, record_id, text)?;
+            Ok(())
+        }
+        [cmd, path, record_id] if cmd == "rec-delete" => {
+            cmd_rec_delete(path, record_id)?;
+            Ok(())
+        }
+        [cmd, path] if cmd == "rec-scan" => {
+            cmd_rec_scan(path)?;
             Ok(())
         }
         _ => Err(CliError::Usage),
@@ -147,6 +172,49 @@ fn cmd_page_read(path: &str, page_id: &str, len: &str) -> io::Result<()> {
     let page = pages.read_page(id)?;
     println!("{}", String::from_utf8_lossy(&page.data()[..len]));
     Ok(())
+}
+
+fn cmd_rec_insert(path: &str, text: &str) -> io::Result<()> {
+    let mut records = RecordFile::open(path)?;
+    let id = records.insert(text.as_bytes())?;
+    println!("inserted record {id}");
+    Ok(())
+}
+
+fn cmd_rec_get(path: &str, record_id: &str) -> io::Result<()> {
+    let id = parse_record_id(record_id)?;
+    let mut records = RecordFile::open(path)?;
+    let bytes = records.get(id)?;
+    println!("{}", String::from_utf8_lossy(&bytes));
+    Ok(())
+}
+
+fn cmd_rec_update(path: &str, record_id: &str, text: &str) -> io::Result<()> {
+    let id = parse_record_id(record_id)?;
+    let mut records = RecordFile::open(path)?;
+    records.update(id, text.as_bytes())?;
+    println!("updated record {id}");
+    Ok(())
+}
+
+fn cmd_rec_delete(path: &str, record_id: &str) -> io::Result<()> {
+    let id = parse_record_id(record_id)?;
+    let mut records = RecordFile::open(path)?;
+    records.delete(id)?;
+    println!("deleted record {id}");
+    Ok(())
+}
+
+fn cmd_rec_scan(path: &str) -> io::Result<()> {
+    let mut records = RecordFile::open(path)?;
+    for (id, bytes) in records.scan()? {
+        println!("{id} {}", String::from_utf8_lossy(&bytes));
+    }
+    Ok(())
+}
+
+fn parse_record_id(raw: &str) -> io::Result<RecordId> {
+    raw.parse()
 }
 
 fn parse_offset(raw: &str) -> io::Result<u64> {
