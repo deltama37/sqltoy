@@ -7,14 +7,16 @@ are in `docs/adr/`:
 - ADR-0001 chooses Rust and the initial scope.
 - ADR-0002 fixes a bottom-up implementation order.
 - ADR-0003 fixes the page size and the header page format.
+- ADR-0004 fixes the slotted-page record format.
 
 ## Status
 
 The Storage layer (ADR-0002 step 1) reads and writes a local file by byte
 offset. The Page Manager (ADR-0002 step 2, per ADR-0003) is implemented on
 top of Storage: fixed 4096-byte pages, a reserved header page (page 0), and
-allocate/read/write of pages with persistence. Records and SQL are not
-implemented yet.
+allocate/read/write of pages with persistence. Record Storage (ADR-0002
+step 3, per ADR-0004) stores variable-length records in slotted pages and
+addresses them with stable record ids. SQL is not implemented yet.
 
 ## Build and test
 
@@ -59,4 +61,32 @@ allocated page 1
 wrote 10 bytes to page 1
 hello-page
 2
+```
+
+## Record CLI
+
+```bash
+cargo run --quiet -- rec-insert /tmp/records.db "Alice"
+cargo run --quiet -- rec-insert /tmp/records.db "Bob"
+cargo run --quiet -- rec-get /tmp/records.db 1:0
+cargo run --quiet -- rec-update /tmp/records.db 1:0 "Alicia"
+cargo run --quiet -- rec-scan /tmp/records.db
+cargo run --quiet -- rec-delete /tmp/records.db 1:1
+cargo run --quiet -- rec-scan /tmp/records.db
+```
+
+`rec-insert` appends a record and prints its id (`page:slot`). `rec-get` prints
+the stored bytes as text. `rec-update` and `rec-delete` keep that same id.
+`rec-scan` prints each live record in page order, then slot order. Each command
+is a new process; a later `rec-scan` shows the update and the delete:
+
+```text
+inserted record 1:0
+inserted record 1:1
+Alice
+updated record 1:0
+1:0 Alicia
+1:1 Bob
+deleted record 1:1
+1:0 Alicia
 ```
