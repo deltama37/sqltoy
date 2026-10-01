@@ -87,7 +87,7 @@ pub struct TableSchema {
 
 /// An open database file and the schemas loaded from its catalog.
 pub struct Database {
-    records: RecordFile,
+    pub(crate) records: RecordFile,
     tables: Vec<TableSchema>,
 }
 

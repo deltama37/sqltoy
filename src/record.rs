@@ -135,14 +135,15 @@ impl RecordFile {
         }
     }
 
-    /// Replaces the record identified by `id` on `table`. The id does not change.
+    /// Replaces the record identified by `id` on `table` when the bytes fit.
     ///
-    /// A missing record, including one stored on a page owned by another
-    /// table, is [`ErrorKind::NotFound`]. A value longer than
-    /// [`MAX_RECORD_SIZE`] is [`ErrorKind::InvalidInput`]. A value that does
-    /// not fit on the same page is [`ErrorKind::InvalidInput`] and leaves the
-    /// page unchanged. [`TableId`] `0` is [`ErrorKind::InvalidInput`].
-    pub fn update(&mut self, table: TableId, id: RecordId, record: &[u8]) -> io::Result<()> {
+    /// Returns `Ok(true)` after the new bytes are stored. Returns `Ok(false)`
+    /// when they do not fit on the same page; the page is left unchanged and
+    /// the id is not moved. A missing record, including one stored on a page
+    /// owned by another table, is [`ErrorKind::NotFound`]. A value longer than
+    /// [`MAX_RECORD_SIZE`] is [`ErrorKind::InvalidInput`]. [`TableId`] `0` is
+    /// [`ErrorKind::InvalidInput`].
+    pub fn try_update(&mut self, table: TableId, id: RecordId, record: &[u8]) -> io::Result<bool> {
         require_table(table)?;
         let mut page = self.read_owned_page(table, id)?;
         if page.get(id.slot_id).is_none() {
@@ -152,17 +153,34 @@ impl RecordFile {
             return Err(record_too_large(record.len()));
         }
         match page.update(id.slot_id, record) {
-            Ok(true) => {}
-            Ok(false) => {
-                return Err(io::Error::new(
-                    ErrorKind::InvalidInput,
-                    format!("record does not fit in page: {id}"),
-                ));
+            Ok(true) => {
+                self.store(id.page_id, &page)?;
+                Ok(true)
             }
-            Err(err) if err.kind() == ErrorKind::NotFound => return Err(not_found(id)),
-            Err(err) => return Err(err),
+            Ok(false) => Ok(false),
+            Err(err) if err.kind() == ErrorKind::NotFound => Err(not_found(id)),
+            Err(err) => Err(err),
         }
-        self.store(id.page_id, &page)
+    }
+
+    /// Replaces the record identified by `id` on `table`. The id does not change.
+    ///
+    /// A missing record, including one stored on a page owned by another
+    /// table, is [`ErrorKind::NotFound`]. A value longer than
+    /// [`MAX_RECORD_SIZE`] is [`ErrorKind::InvalidInput`]. A value that does
+    /// not fit on the same page is [`ErrorKind::InvalidInput`] and leaves the
+    /// page unchanged. [`TableId`] `0` is [`ErrorKind::InvalidInput`].
+    ///
+    /// This is [`Self::try_update`], with `Ok(false)` mapped to the fit error.
+    pub fn update(&mut self, table: TableId, id: RecordId, record: &[u8]) -> io::Result<()> {
+        if self.try_update(table, id, record)? {
+            Ok(())
+        } else {
+            Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("record does not fit in page: {id}"),
+            ))
+        }
     }
 
     /// Tombstones the record identified by `id` on `table`.
@@ -421,6 +439,28 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::NotFound);
         assert_eq!(err.to_string(), "record not found: 1:1");
         assert_eq!(file.get(TABLE, id).unwrap(), vec![7u8; MAX_RECORD_SIZE]);
+    }
+
+    #[test]
+    fn try_update_returns_false_when_the_record_does_not_fit() {
+        let db = TempDb::new("tryupd");
+        let mut file = RecordFile::open(db.path()).unwrap();
+        let first = file.insert(TABLE, &[1u8; 2000]).unwrap();
+        let second = file.insert(TABLE, &[2u8; 2000]).unwrap();
+        assert!(!file.try_update(TABLE, first, &[3u8; 3000]).unwrap());
+        assert_eq!(file.get(TABLE, first).unwrap(), vec![1u8; 2000]);
+        assert_eq!(file.get(TABLE, second).unwrap(), vec![2u8; 2000]);
+        assert!(file.try_update(TABLE, first, &[4u8; 100]).unwrap());
+        assert_eq!(file.get(TABLE, first).unwrap(), vec![4u8; 100]);
+
+        let missing = RecordId {
+            page_id: PageId(1),
+            slot_id: 9,
+        };
+        let err = file.try_update(TABLE, missing, b"nope").unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
+        assert_eq!(err.to_string(), "record not found: 1:9");
+        assert_eq!(file.get(TABLE, first).unwrap(), vec![4u8; 100]);
     }
 
     #[test]
