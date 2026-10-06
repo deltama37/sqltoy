@@ -10,6 +10,7 @@ are in `docs/adr/`:
 - ADR-0004 fixes the slotted-page record format.
 - ADR-0005 fixes table page ownership and the catalog record format.
 - ADR-0006 fixes row encoding and table operations.
+- ADR-0007 fixes the SQL lexer, grammar, and AST.
 
 ## Status
 
@@ -23,8 +24,10 @@ The Catalog (ADR-0002 step 4, per ADR-0005) is done: table schemas are stored
 in the database file and restored when the file is opened. The header format
 version is 2. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
 typed rows, including NULL, can be inserted, scanned, updated, and deleted.
-An update that no longer fits on its page is stored at a new record id. SQL
-is not implemented yet.
+An update that no longer fits on its page is stored at a new record id. The
+SQL parser (ADR-0002 step 6, per ADR-0007) is done: `CREATE TABLE`, `INSERT`,
+`SELECT`, `UPDATE`, and `DELETE` parse into an AST, including `WHERE` and
+expressions. The executor is not implemented yet.
 
 ## Build and test
 
@@ -158,3 +161,28 @@ updated row 2:0
 deleted row 2:1
 2:0 (1, 'Alicia', 31)
 ```
+
+## SQL parser CLI
+
+```bash
+cargo run --quiet -- parse "CREATE TABLE users (id INTEGER, name TEXT)"
+cargo run --quiet -- parse "INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob')"
+cargo run --quiet -- parse "SELECT id, name AS n FROM users WHERE id = 1"
+cargo run --quiet -- parse "SELECT 1 + 2 * 3 FROM t; DELETE FROM t WHERE id != 1"
+```
+
+`parse` does not open a database file. It prints each statement on its own
+line, followed by a semicolon. Keywords come out in uppercase. Every compound
+expression is parenthesized, and `!=` is printed as `<>`:
+
+```text
+CREATE TABLE users (id INTEGER, name TEXT);
+INSERT INTO users (id, name) VALUES (1, 'Alice'), (2, 'Bob');
+SELECT id, name AS n FROM users WHERE (id = 1);
+SELECT (1 + (2 * 3)) FROM t;
+DELETE FROM t WHERE (id <> 1);
+```
+
+A syntax error goes to stderr and the process exits with status 1.
+`SELECT * WHERE id = 1` prints
+`error: syntax error at 1:10: expected FROM, found WHERE`.

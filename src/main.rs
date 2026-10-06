@@ -29,6 +29,7 @@ commands:
   sqltoy row-scan <db_path> <table>
   sqltoy row-update <db_path> <table> <record_id> <value>...
   sqltoy row-delete <db_path> <table> <record_id>
+  sqltoy parse <sql>
 ";
 
 fn main() -> ExitCode {
@@ -130,6 +131,10 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         }
         [cmd, path, table, record_id] if cmd == "row-delete" => {
             cmd_row_delete(path, table, record_id)?;
+            Ok(())
+        }
+        [cmd, sql] if cmd == "parse" => {
+            cmd_parse(sql)?;
             Ok(())
         }
         _ => Err(CliError::Usage),
@@ -315,6 +320,13 @@ fn cmd_row_delete(path: &str, table: &str, record_id: &str) -> io::Result<()> {
     let mut db = Database::open(path)?;
     db.delete(table, id)?;
     println!("deleted row {id}");
+    Ok(())
+}
+
+fn cmd_parse(sql: &str) -> io::Result<()> {
+    for statement in sqltoy::sql::parse(sql)? {
+        println!("{statement};");
+    }
     Ok(())
 }
 
