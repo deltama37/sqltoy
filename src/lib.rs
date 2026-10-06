@@ -9,8 +9,10 @@
 //! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` text into an
 //! AST. The executor evaluates expressions, including `WHERE`, and runs those
 //! statements. A primary key is an `INTEGER` column indexed by a B+Tree, so
-//! `WHERE id = 1` can read one row without scanning the table. Later layers
-//! are specified in `docs/adr/`.
+//! `WHERE id = 1` can read one row without scanning the table. A `SELECT`
+//! runs as a tree of operators: sequential or index scans, nested-loop
+//! joins, filter, projection, sort, and limit. Later layers are specified
+//! in `docs/adr/`.
 
 pub mod btree;
 pub mod catalog;

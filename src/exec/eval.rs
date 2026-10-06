@@ -13,18 +13,27 @@ use crate::catalog::Column;
 use crate::row::Value;
 use crate::sql::{BinaryOp, ColumnRef, Expr, Literal, UnaryOp};
 
-/// Names and values visible to an expression.
-pub struct RowContext<'a> {
-    /// Table name as stored in the schema.
-    pub table: &'a str,
+/// One `FROM` binding visible to an expression.
+pub struct Binding<'a> {
+    /// Binding name: the alias, or the table name when there is no alias.
+    pub name: &'a str,
     /// Columns in definition order.
     pub columns: &'a [Column],
     /// Current row, aligned with `columns`.
     ///
     /// `None` when the expression is not evaluated against a row, as in
-    /// `INSERT` values. A column reference is then `column not found`,
-    /// including a name that exists on the table.
+    /// `INSERT` values and `LIMIT`. A column reference is then
+    /// `column not found`, including a name that exists on the table.
     pub values: Option<&'a [Value]>,
+}
+
+/// Names and values visible to an expression.
+///
+/// A single-table statement has one binding. An empty slice is no row
+/// context. Comparison of binding and column names ignores ASCII case.
+pub struct RowContext<'a> {
+    /// Bindings in `FROM` order. `ON` sees only the prefix up to that join.
+    pub bindings: &'a [Binding<'a>],
 }
 
 /// Evaluates `expr` against `ctx`.
@@ -54,40 +63,85 @@ pub fn eval(expr: &Expr, ctx: &RowContext<'_>) -> io::Result<Value> {
     }
 }
 
-/// Resolves every column reference in `expr` against the schema.
+/// Resolves every column reference in `expr` against one table.
 ///
 /// An unknown column, or a qualifier other than `table`, is
-/// `column not found`. No row is read.
+/// `column not found`. No row is read. This is the single-table form of
+/// [`bind_context`].
 pub(crate) fn bind_expr(table: &str, columns: &[Column], expr: &Expr) -> io::Result<()> {
+    let binding = Binding {
+        name: table,
+        columns,
+        values: None,
+    };
+    bind_context(
+        &RowContext {
+            bindings: &[binding],
+        },
+        expr,
+    )
+}
+
+/// Resolves every column reference in `expr` against `ctx`.
+///
+/// An unknown column is `column not found`. An unqualified name that matches
+/// more than one binding is `ambiguous column`. No row is read.
+pub(crate) fn bind_context(ctx: &RowContext<'_>, expr: &Expr) -> io::Result<()> {
     match expr {
         Expr::Literal(_) => Ok(()),
         Expr::Column(reference) => {
-            resolve_column(table, columns, reference)?;
+            resolve_ref(ctx, reference)?;
             Ok(())
         }
-        Expr::Unary { expr, .. } => bind_expr(table, columns, expr),
+        Expr::Unary { expr, .. } => bind_context(ctx, expr),
         Expr::Binary { left, right, .. } => {
-            bind_expr(table, columns, left)?;
-            bind_expr(table, columns, right)
+            bind_context(ctx, left)?;
+            bind_context(ctx, right)
         }
-        Expr::IsNull { expr, .. } => bind_expr(table, columns, expr),
+        Expr::IsNull { expr, .. } => bind_context(ctx, expr),
     }
 }
 
-pub(crate) fn resolve_column(
-    table: &str,
-    columns: &[Column],
+/// Binding index and column index of `reference`.
+pub(crate) fn resolve_ref(
+    ctx: &RowContext<'_>,
     reference: &ColumnRef,
-) -> io::Result<usize> {
+) -> io::Result<(usize, usize)> {
     if let Some(qualifier) = &reference.table {
-        if !qualifier.eq_ignore_ascii_case(table) {
-            return Err(column_not_found(&reference.to_string()));
+        let hits: Vec<usize> = ctx
+            .bindings
+            .iter()
+            .enumerate()
+            .filter(|(_, binding)| binding.name.eq_ignore_ascii_case(qualifier))
+            .map(|(index, _)| index)
+            .collect();
+        let binding_index = match hits.as_slice() {
+            [index] => *index,
+            [] => return Err(column_not_found(&reference.to_string())),
+            _ => return Err(ambiguous_column(&reference.column)),
+        };
+        let column_index = column_index(&ctx.bindings[binding_index], &reference.column)
+            .ok_or_else(|| column_not_found(&reference.to_string()))?;
+        return Ok((binding_index, column_index));
+    }
+    let mut found = Vec::new();
+    for (binding_index, binding) in ctx.bindings.iter().enumerate() {
+        if let Some(column_index) = column_index(binding, &reference.column) {
+            found.push((binding_index, column_index));
         }
     }
-    columns
+    match found.as_slice() {
+        [(binding_index, column_index)] => Ok((*binding_index, *column_index)),
+        [] => Err(column_not_found(&reference.to_string())),
+        _ => Err(ambiguous_column(&reference.column)),
+    }
+}
+
+fn column_index(binding: &Binding<'_>, name: &str) -> Option<usize> {
+    binding
+        .columns
         .iter()
-        .position(|column| column.name.eq_ignore_ascii_case(&reference.column))
-        .ok_or_else(|| column_not_found(&reference.to_string()))
+        .position(|column| column.name.eq_ignore_ascii_case(name))
 }
 
 pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
@@ -96,6 +150,10 @@ pub(crate) fn invalid(message: impl Into<String>) -> io::Error {
 
 pub(crate) fn column_not_found(name: &str) -> io::Error {
     invalid(format!("column not found: {name}"))
+}
+
+pub(crate) fn ambiguous_column(name: &str) -> io::Error {
+    invalid(format!("ambiguous column: {name}"))
 }
 
 fn literal_value(literal: &Literal) -> Value {
@@ -108,9 +166,9 @@ fn literal_value(literal: &Literal) -> Value {
 }
 
 fn eval_column(ctx: &RowContext<'_>, reference: &ColumnRef) -> io::Result<Value> {
-    let index = resolve_column(ctx.table, ctx.columns, reference)?;
-    match ctx.values {
-        Some(values) => Ok(values[index].clone()),
+    let (binding_index, column_index) = resolve_ref(ctx, reference)?;
+    match ctx.bindings[binding_index].values {
+        Some(values) => Ok(values[column_index].clone()),
         None => Err(column_not_found(&reference.to_string())),
     }
 }
@@ -251,7 +309,7 @@ fn type_mismatch_unary(op: &UnaryOp, value: &Value) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{eval, RowContext};
+    use super::{eval, Binding, RowContext};
     use crate::catalog::{Column, ColumnType};
     use crate::row::Value;
     use crate::sql::{parse, Expr, SelectItem, Statement};
@@ -281,11 +339,7 @@ mod tests {
     }
 
     fn bare<'a>() -> RowContext<'a> {
-        RowContext {
-            table: "t",
-            columns: &[],
-            values: None,
-        }
+        RowContext { bindings: &[] }
     }
 
     fn column(name: &str, column_type: ColumnType) -> Column {
@@ -463,10 +517,13 @@ mod tests {
             column("name", ColumnType::Text),
         ];
         let values = vec![Value::Integer(7), Value::Text("Ada".to_string())];
-        let ctx = RowContext {
-            table: "users",
+        let binding = Binding {
+            name: "users",
             columns: &columns,
             values: Some(&values),
+        };
+        let ctx = RowContext {
+            bindings: &[binding],
         };
         assert_eq!(eval_sql("id", &ctx), Value::Integer(7));
         assert_eq!(eval_sql("ID", &ctx), Value::Integer(7));
@@ -478,13 +535,52 @@ mod tests {
         assert_eq!(eval_err("users.nope", &ctx), "column not found: users.nope");
         assert_eq!(eval_err("other.id", &ctx), "column not found: other.id");
 
-        let no_row = RowContext {
-            table: "users",
+        let no_binding = Binding {
+            name: "users",
             columns: &columns,
             values: None,
+        };
+        let no_row = RowContext {
+            bindings: &[no_binding],
         };
         assert_eq!(eval_err("id", &no_row), "column not found: id");
         assert_eq!(eval_err("users.id", &no_row), "column not found: users.id");
         assert_eq!(eval_err("other.id", &no_row), "column not found: other.id");
+    }
+
+    #[test]
+    fn qualified_names_follow_bindings() {
+        let users_columns = vec![
+            column("id", ColumnType::Integer),
+            column("name", ColumnType::Text),
+        ];
+        let orders_columns = vec![
+            column("id", ColumnType::Integer),
+            column("user_id", ColumnType::Integer),
+        ];
+        let users_row = vec![Value::Integer(1), Value::Text("Ada".to_string())];
+        let orders_row = vec![Value::Integer(9), Value::Integer(1)];
+        let bindings = [
+            Binding {
+                name: "u",
+                columns: &users_columns,
+                values: Some(&users_row),
+            },
+            Binding {
+                name: "orders",
+                columns: &orders_columns,
+                values: Some(&orders_row),
+            },
+        ];
+        let ctx = RowContext {
+            bindings: &bindings,
+        };
+        assert_eq!(eval_sql("u.id", &ctx), Value::Integer(1));
+        assert_eq!(eval_sql("name", &ctx), Value::Text("Ada".to_string()));
+        assert_eq!(eval_sql("orders.id", &ctx), Value::Integer(9));
+        assert_eq!(eval_sql("user_id", &ctx), Value::Integer(1));
+        assert_eq!(eval_err("id", &ctx), "ambiguous column: id");
+        assert_eq!(eval_err("users.id", &ctx), "column not found: users.id");
+        assert_eq!(eval_err("nope", &ctx), "column not found: nope");
     }
 }

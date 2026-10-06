@@ -55,15 +55,70 @@ pub struct Insert {
     pub rows: Vec<Vec<Expr>>,
 }
 
-/// `SELECT items FROM table [WHERE expr]`.
+/// `SELECT items FROM ... [WHERE expr] [ORDER BY ...] [LIMIT expr [OFFSET expr]]`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Select {
     /// Select list, in order. At least one item.
     pub items: Vec<SelectItem>,
-    /// Table name in the `FROM` clause.
-    pub from: String,
+    /// `FROM` clause, including joins.
+    pub from: FromItem,
     /// `WHERE` expression when the clause was written.
     pub filter: Option<Expr>,
+    /// `ORDER BY` items, in order. Empty when the clause was omitted.
+    pub order_by: Vec<OrderItem>,
+    /// `LIMIT` expression when the clause was written.
+    pub limit: Option<Expr>,
+    /// `OFFSET` expression. Present only when `limit` is present.
+    pub offset: Option<Expr>,
+}
+
+/// `table_ref join*`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FromItem {
+    /// First table in the `FROM` clause.
+    pub first: TableRef,
+    /// Joins, left to right. `a JOIN b JOIN c` is `(a JOIN b) JOIN c`.
+    pub joins: Vec<Join>,
+}
+
+/// A table name and an optional alias (`AS` may be omitted).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TableRef {
+    /// Table name, with the spelling from the source.
+    pub table: String,
+    /// Alias, with the spelling from the source.
+    pub alias: Option<String>,
+}
+
+/// One join after the first table.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    /// `INNER`, `LEFT`, or `CROSS`.
+    pub kind: JoinKind,
+    /// Right-hand table.
+    pub table: TableRef,
+    /// `ON` expression. `None` for `CROSS JOIN` and for a comma join.
+    pub on: Option<Expr>,
+}
+
+/// Kind of [`Join`]. A comma in `FROM` is [`JoinKind::Cross`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JoinKind {
+    /// `JOIN` or `INNER JOIN`.
+    Inner,
+    /// `LEFT JOIN` or `LEFT OUTER JOIN`.
+    Left,
+    /// `CROSS JOIN`, or a comma between table references.
+    Cross,
+}
+
+/// One `ORDER BY` item.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OrderItem {
+    /// Sort expression.
+    pub expr: Expr,
+    /// `true` for `DESC`. Omitted direction and `ASC` are `false`.
+    pub descending: bool,
 }
 
 /// One item in a [`Select`] list.
@@ -71,6 +126,8 @@ pub struct Select {
 pub enum SelectItem {
     /// `*`.
     Wildcard,
+    /// `name.*`.
+    QualifiedWildcard(String),
     /// An expression and an optional output name.
     Expr {
         /// Selected expression.
@@ -260,7 +317,62 @@ impl fmt::Display for Select {
         write!(f, "SELECT ")?;
         write_comma_sep(f, &self.items)?;
         write!(f, " FROM {}", self.from)?;
-        write_where(f, self.filter.as_ref())
+        write_where(f, self.filter.as_ref())?;
+        if !self.order_by.is_empty() {
+            write!(f, " ORDER BY ")?;
+            write_comma_sep(f, &self.order_by)?;
+        }
+        if let Some(limit) = &self.limit {
+            write!(f, " LIMIT {limit}")?;
+            if let Some(offset) = &self.offset {
+                write!(f, " OFFSET {offset}")?;
+            }
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for FromItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.first)?;
+        for join in &self.joins {
+            write!(f, " {join}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for TableRef {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.table)?;
+        if let Some(alias) = &self.alias {
+            write!(f, " AS {alias}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for Join {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self.kind {
+            JoinKind::Inner => write!(f, "INNER JOIN {}", self.table)?,
+            JoinKind::Left => write!(f, "LEFT JOIN {}", self.table)?,
+            JoinKind::Cross => write!(f, "CROSS JOIN {}", self.table)?,
+        }
+        if let Some(on) = &self.on {
+            write!(f, " ON {on}")?;
+        }
+        Ok(())
+    }
+}
+
+impl fmt::Display for OrderItem {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{}", self.expr)?;
+        if self.descending {
+            write!(f, " DESC")?;
+        }
+        Ok(())
     }
 }
 
@@ -268,6 +380,7 @@ impl fmt::Display for SelectItem {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         match self {
             SelectItem::Wildcard => f.write_str("*"),
+            SelectItem::QualifiedWildcard(name) => write!(f, "{name}.*"),
             SelectItem::Expr { expr, alias } => {
                 write!(f, "{expr}")?;
                 if let Some(alias) = alias {
