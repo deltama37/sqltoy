@@ -47,6 +47,7 @@ pub(crate) enum TokenKind {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Keyword {
     And,
+    Analyze,
     As,
     Asc,
     Begin,
@@ -56,6 +57,7 @@ pub(crate) enum Keyword {
     Cross,
     Delete,
     Desc,
+    Explain,
     False,
     From,
     Inner,
@@ -92,6 +94,7 @@ impl Keyword {
     pub(crate) fn as_str(self) -> &'static str {
         match self {
             Keyword::And => "AND",
+            Keyword::Analyze => "ANALYZE",
             Keyword::As => "AS",
             Keyword::Asc => "ASC",
             Keyword::Begin => "BEGIN",
@@ -101,6 +104,7 @@ impl Keyword {
             Keyword::Cross => "CROSS",
             Keyword::Delete => "DELETE",
             Keyword::Desc => "DESC",
+            Keyword::Explain => "EXPLAIN",
             Keyword::False => "FALSE",
             Keyword::From => "FROM",
             Keyword::Inner => "INNER",
@@ -137,6 +141,7 @@ impl Keyword {
     fn from_word(word: &str) -> Option<Keyword> {
         Some(match word.to_ascii_lowercase().as_str() {
             "and" => Keyword::And,
+            "analyze" => Keyword::Analyze,
             "as" => Keyword::As,
             "asc" => Keyword::Asc,
             "begin" => Keyword::Begin,
@@ -146,6 +151,7 @@ impl Keyword {
             "cross" => Keyword::Cross,
             "delete" => Keyword::Delete,
             "desc" => Keyword::Desc,
+            "explain" => Keyword::Explain,
             "false" => Keyword::False,
             "from" => Keyword::From,
             "inner" => Keyword::Inner,

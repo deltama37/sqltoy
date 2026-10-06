@@ -84,9 +84,28 @@ impl Parser {
             Ok(Statement::Rollback)
         } else if self.eat_keyword(Keyword::Vacuum) {
             Ok(Statement::Vacuum)
+        } else if self.eat_keyword(Keyword::Explain) {
+            self.parse_explain()
         } else {
             Err(self.expected("statement"))
         }
+    }
+
+    fn parse_explain(&mut self) -> io::Result<Statement> {
+        let analyze = self.eat_keyword(Keyword::Analyze);
+        let statement = if self.at_keyword(Keyword::Select) {
+            Statement::Select(self.parse_select()?)
+        } else if self.at_keyword(Keyword::Update) {
+            Statement::Update(self.parse_update()?)
+        } else if self.at_keyword(Keyword::Delete) {
+            Statement::Delete(self.parse_delete()?)
+        } else {
+            return Err(self.expected("SELECT, UPDATE, or DELETE"));
+        };
+        Ok(Statement::Explain {
+            analyze,
+            statement: Box::new(statement),
+        })
     }
 
     fn parse_begin(&mut self) -> io::Result<Statement> {
@@ -755,6 +774,23 @@ mod tests {
         assert_eq!(parse_one("COMMIT"), Statement::Commit);
         assert_eq!(parse_one("ROLLBACK"), Statement::Rollback);
         assert_eq!(parse_one("VACUUM"), Statement::Vacuum);
+        let explained = parse_one("EXPLAIN ANALYZE SELECT id FROM t WHERE id = 1");
+        assert_eq!(parse_one(&explained.to_string()), explained);
+        let Statement::Explain { analyze, statement } = explained else {
+            panic!("explain");
+        };
+        assert!(analyze);
+        assert!(matches!(statement.as_ref(), Statement::Select(_)));
+        let update = parse_one("EXPLAIN UPDATE t SET id = 1 WHERE id > 2");
+        assert_eq!(parse_one(&update.to_string()), update);
+        let delete = parse_one("EXPLAIN DELETE FROM t WHERE id < 3");
+        assert_eq!(parse_one(&delete.to_string()), delete);
+        let err = parse("EXPLAIN INSERT INTO t VALUES (1)").unwrap_err();
+        assert!(
+            err.to_string()
+                .contains("expected SELECT, UPDATE, or DELETE, found INSERT"),
+            "{err}"
+        );
         assert_eq!(parse_one("vacuum").to_string(), "VACUUM");
         assert_eq!(parse_one("BEGIN TRANSACTION").to_string(), "BEGIN");
         assert_eq!(parse_one("commit").to_string(), "COMMIT");

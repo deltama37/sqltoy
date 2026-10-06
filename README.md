@@ -21,6 +21,7 @@ are in `docs/adr/`:
   atomicity, and no-steal rollback.
 - ADR-0013 fixes the write-ahead log and crash recovery.
 - ADR-0014 fixes multi-version concurrency: sessions, snapshots, and `VACUUM`.
+- ADR-0015 fixes the rule-based query planner and `EXPLAIN` / `EXPLAIN ANALYZE`.
 
 ## Status
 
@@ -74,7 +75,15 @@ done. Each session has its own snapshot. A scan or index lookup returns only
 versions visible to that snapshot. `VACUUM` removes versions that every
 active snapshot has stopped seeing. If a commit flushes another session's
 uncommitted versions, the header cleanup flag is set and the next open
-removes them.
+removes them. The query planner (ADR-0002 step 14, per ADR-0015) is done.
+`EXPLAIN` prints the operator tree and does not run the statement.
+`EXPLAIN ANALYZE` runs a `SELECT` and appends each operator's output row
+count and the pages read during that execution. A primary-key equality is
+an index lookup, a primary-key range is an index scan, and `ORDER BY` of
+that key ascending skips the sort. An inner or left join on the right
+table's primary key is an index nested loop. `Database::set_planner_enabled(false)`
+forces sequential scans, nested loops, and a sort. All 14 steps in ADR-0002
+are done.
 
 ## Build and test
 
@@ -158,6 +167,45 @@ INSERT 4
   4 | a    
   1 | a    
 (2 rows)
+```
+
+## Query planner
+
+`EXPLAIN` prints the operator tree for a `SELECT`, `UPDATE`, or `DELETE`
+and does not run it. `EXPLAIN ANALYZE` runs a `SELECT` and adds
+` (rows=n)` on each operator plus a final `Pages read:` line. A predicate
+that mentions one binding is applied above that binding's scan, unless it
+mentions the nullable side of a `LEFT JOIN`. `pk = constant` is an index
+lookup. Inequalities on the primary key become one ascending index range,
+including reversed forms such as `5 < id`. `ORDER BY id LIMIT 2` reads the
+index and stops. `ON o.id = u.last_order` looks up `orders` once per left
+row. `Database::set_planner_enabled(false)` keeps the older shape: sequential
+scans, nested loops, one filter above the joins, and a sort.
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-plan.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT, last_order INTEGER); CREATE TABLE orders (id INTEGER PRIMARY KEY, item TEXT); INSERT INTO users VALUES (1, 'Ann', NULL), (3, 'Bea', 11), (4, 'Cam', 10); INSERT INTO orders VALUES (10, 'pen'), (11, 'cup'); EXPLAIN SELECT u.name, o.item FROM users u INNER JOIN orders o ON o.id = u.last_order WHERE u.id >= 3 LIMIT 10; EXPLAIN ANALYZE SELECT id, name FROM users ORDER BY id LIMIT 2"
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+INSERT 3
+INSERT 2
+ QUERY PLAN                                                      
+-----------------------------------------------------------------
+ Limit 10                                                        
+   Project u.name, o.item                                        
+     IndexNestedLoopJoin inner orders AS o (o.id = u.last_order) 
+       Filter (u.id >= 3)                                        
+         IndexScan users AS u (id >= 3)                          
+(5 rows)
+ QUERY PLAN                   
+------------------------------
+ Limit 2 (rows=2)             
+   Project id, name (rows=2)  
+     IndexScan users (rows=2) 
+ Pages read: 4                
+(4 rows)
 ```
 
 `repl` reads SQL from stdin. A statement runs when the buffer, ignoring

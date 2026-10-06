@@ -30,6 +30,13 @@ pub enum Statement {
     Rollback,
     /// `VACUUM`.
     Vacuum,
+    /// `EXPLAIN` or `EXPLAIN ANALYZE` of a `SELECT`, `UPDATE`, or `DELETE`.
+    Explain {
+        /// `true` for `EXPLAIN ANALYZE`.
+        analyze: bool,
+        /// Statement whose plan is shown. Execution runs only when `analyze` is set.
+        statement: Box<Statement>,
+    },
 }
 
 /// `CREATE TABLE name (column type, ...)`.
@@ -283,6 +290,13 @@ impl fmt::Display for Statement {
             Statement::Commit => f.write_str("COMMIT"),
             Statement::Rollback => f.write_str("ROLLBACK"),
             Statement::Vacuum => f.write_str("VACUUM"),
+            Statement::Explain { analyze, statement } => {
+                if *analyze {
+                    write!(f, "EXPLAIN ANALYZE {statement}")
+                } else {
+                    write!(f, "EXPLAIN {statement}")
+                }
+            }
         }
     }
 }
