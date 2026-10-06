@@ -287,9 +287,12 @@ impl Database {
     /// Flushes dirty pages and ends the explicit transaction.
     ///
     /// No open transaction is [`ErrorKind::InvalidInput`]
-    /// (`no transaction in progress`). If flush fails, the transaction stays
-    /// open: pages already written are clean, and the rest stay dirty. Retry
-    /// [`Self::commit`] or call [`Self::rollback`].
+    /// (`no transaction in progress`). The flush commits through the WAL. If
+    /// it fails before that log is synced, the transaction stays open and the
+    /// dirty pages remain. If it fails after the sync, the commit is durable
+    /// in the WAL and the frames are clean. Retry [`Self::commit`] or call
+    /// [`Self::rollback`]. Rollback does not erase a commit already synced to
+    /// the WAL; the next open replays it.
     pub fn commit(&mut self) -> io::Result<()> {
         if !self.in_transaction {
             return Err(io::Error::new(
@@ -337,10 +340,11 @@ impl Database {
     /// catalog is reloaded, and `body`'s error is returned. Outside an
     /// explicit transaction, dirty frames are also discarded.
     ///
-    /// If the autocommit flush fails, remaining dirty frames are discarded,
-    /// the catalog is reloaded from whatever reached disk, and the flush
-    /// error is returned instead of `body`'s value. A flush writes pages in
-    /// id order, so a failure can leave a prefix of those pages on disk.
+    /// If the autocommit flush fails before the WAL sync, dirty frames are
+    /// discarded and the catalog is reloaded. If it fails after that sync,
+    /// the frames are already clean, so discarding dirty frames leaves the
+    /// committed images in place. The next open replays the WAL when the
+    /// checkpoint did not finish.
     pub(crate) fn in_statement<T>(
         &mut self,
         body: impl FnOnce(&mut Self) -> io::Result<T>,
@@ -637,6 +641,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -648,6 +653,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 

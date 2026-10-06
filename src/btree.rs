@@ -561,6 +561,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-btree-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -572,6 +573,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 

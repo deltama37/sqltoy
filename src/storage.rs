@@ -45,6 +45,14 @@ impl Storage {
         Ok(self.len()? == 0)
     }
 
+    /// Sets the file length.
+    ///
+    /// Extending fills the new bytes with zeros. Truncating drops the tail.
+    /// The new length is durable after [`Self::sync`].
+    pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+        self.file.set_len(len)
+    }
+
     /// Flushes buffered data and syncs the file so writes are durable.
     pub fn sync(&mut self) -> io::Result<()> {
         self.file.flush()?;
@@ -74,6 +82,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -85,6 +94,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 
@@ -116,5 +126,22 @@ mod tests {
 
         storage.write_at(8, b"xyz").unwrap();
         assert_eq!(storage.len().unwrap(), 11);
+    }
+
+    #[test]
+    fn set_len_extends_with_zeros_and_truncates() {
+        let db = TempDb::new("setlen");
+        let mut storage = Storage::open(db.path()).unwrap();
+        storage.write_at(0, b"abcdef").unwrap();
+        storage.set_len(8).unwrap();
+        assert_eq!(storage.len().unwrap(), 8);
+        assert_eq!(storage.read_at(0, 8).unwrap(), b"abcdef\0\0");
+        storage.set_len(3).unwrap();
+        storage.sync().unwrap();
+        assert_eq!(storage.read_at(0, 3).unwrap(), b"abc");
+        drop(storage);
+
+        let storage = Storage::open(db.path()).unwrap();
+        assert_eq!(storage.len().unwrap(), 3);
     }
 }

@@ -5,8 +5,9 @@
 //! does not read the old page when the frame is cold. Dirty frames are never
 //! evicted (no-steal): when every frame is dirty the pool grows past its
 //! configured capacity and shrinks back after [`BufferPool::flush`] or
-//! [`BufferPool::discard_dirty`]. [`BufferPool::flush`] writes every dirty
-//! frame in page-id order and then syncs.
+//! [`BufferPool::discard_dirty`]. [`BufferPool::flush`] commits dirty frames
+//! to the write-ahead log and then checkpoints them into the database file.
+//! [`BufferPool::open`] replays a committed log before serving pages.
 
 use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
@@ -15,7 +16,9 @@ use std::path::Path;
 #[cfg(test)]
 use std::cell::Cell;
 
-use crate::page::{Page, PageId, PageManager};
+use crate::crash::crash_point;
+use crate::page::{Page, PageId, PageManager, PAGE_SIZE};
+use crate::wal::{Wal, HEADER_LEN};
 
 /// Default number of frames: 256 pages, 1 MiB.
 pub const DEFAULT_POOL_PAGES: usize = 256;
@@ -114,6 +117,7 @@ impl Frame {
 /// flush or [`Self::discard_dirty`].
 pub struct BufferPool {
     pages: PageManager,
+    wal: Wal,
     frames: Vec<Frame>,
     /// Configured frame count. [`Self::frame_count`] may be higher.
     capacity: usize,
@@ -129,7 +133,13 @@ impl BufferPool {
     /// Opens the database at `path` with `frames` slots.
     ///
     /// `frames` must be at least 1. An empty file is initialized by the page
-    /// manager before any frame is filled.
+    /// manager before any frame is filled. The page manager checks the header
+    /// page before the WAL is replayed. Committed WAL pages are then written
+    /// in log order, the file is sized to the last commit's page count, and
+    /// both files are synced. The WAL is truncated to its header whenever it
+    /// is longer than that header, including when the extra bytes are only a
+    /// torn tail, so a later commit is not appended after them. Replay writes
+    /// the same images again, so opening twice leaves the same database.
     pub fn open<P: AsRef<Path>>(path: P, frames: usize) -> io::Result<BufferPool> {
         if frames < 1 {
             return Err(io::Error::new(
@@ -137,7 +147,10 @@ impl BufferPool {
                 "buffer pool needs at least one frame",
             ));
         }
-        let pages = PageManager::open(path)?;
+        let path = path.as_ref();
+        let mut pages = PageManager::open(path)?;
+        let mut wal = Wal::open(path)?;
+        recover(&mut pages, &mut wal)?;
         let logical_pages = pages.page_count()?;
         let mut pool_frames = Vec::with_capacity(frames);
         for _ in 0..frames {
@@ -145,6 +158,7 @@ impl BufferPool {
         }
         Ok(BufferPool {
             pages,
+            wal,
             frames: pool_frames,
             capacity: frames,
             logical_pages,
@@ -221,20 +235,60 @@ impl BufferPool {
         Ok(())
     }
 
-    /// Writes every dirty frame in ascending page id order, then syncs.
+    /// Commits dirty frames, then checkpoints them into the database file.
     ///
-    /// Dirty flags are cleared. Sync runs even when nothing is dirty. Extra
-    /// frames are then dropped, least recently used first, until the pool is
-    /// back to its configured capacity.
+    /// When no frame is dirty this returns without reading or writing either
+    /// file. Sync runs only for a commit that has pages to make durable.
+    /// Extra frames are still dropped until the pool is back to its
+    /// configured capacity.
+    ///
+    /// Otherwise:
+    /// 1. Append the dirty pages in ascending page id order and a commit
+    ///    record, then sync the WAL. That sync is the commit point. Dirty
+    ///    flags are cleared here. The frames hold the committed bytes, and a
+    ///    crash before the checkpoint finishes is repaired by replaying the
+    ///    WAL on the next open.
+    /// 2. Write those pages to the database file and sync it.
+    ///    `mid-checkpoint` aborts after the first of those writes.
+    ///    `before-wal-truncate` aborts after the database sync.
+    /// 3. Truncate the WAL to its header and sync it.
+    ///
+    /// A checkpoint error after the commit point is returned. The commit
+    /// stays in the WAL. Frames are already clean, so they match the
+    /// committed images until the pool is dropped.
     pub fn flush(&mut self) -> io::Result<()> {
         let ids = self.dirty_ids_ascending();
-        for id in ids {
+        if ids.is_empty() {
+            self.shrink();
+            return Ok(());
+        }
+        let mut stored = Vec::with_capacity(ids.len());
+        for id in &ids {
             let index = self
-                .find(id)
+                .find(*id)
                 .expect("dirty page stays resident until flush");
-            self.write_out(index)?;
+            stored.push((*id, copy_page(&self.frames[index].page)));
+        }
+        let borrowed: Vec<(PageId, &Page)> = stored.iter().map(|(id, page)| (*id, page)).collect();
+        self.wal.append_commit(&borrowed, self.logical_pages)?;
+        for id in &ids {
+            let index = self
+                .find(*id)
+                .expect("dirty page stays resident until flush");
+            self.frames[index].dirty = false;
+        }
+        for (index, (id, page)) in stored.iter().enumerate() {
+            self.pages.write_page_extending(*id, page)?;
+            #[cfg(test)]
+            self.disk_writes.push(id.0);
+            self.stats.pages_written += 1;
+            if index == 0 {
+                crash_point("mid-checkpoint");
+            }
         }
         self.pages.sync()?;
+        crash_point("before-wal-truncate");
+        self.wal.truncate()?;
         self.shrink();
         Ok(())
     }
@@ -498,6 +552,22 @@ impl BufferPool {
     }
 }
 
+fn recover(pages: &mut PageManager, wal: &mut Wal) -> io::Result<()> {
+    if let Some(committed) = wal.read_committed()? {
+        for (id, page) in &committed.pages {
+            pages.write_page_extending(*id, page)?;
+        }
+        let len = u64::from(committed.page_count) * PAGE_SIZE as u64;
+        pages.set_len(len)?;
+        pages.sync()?;
+    }
+    // A torn tail must not stay in front of the next commit.
+    if wal.len()? > HEADER_LEN as u64 {
+        wal.truncate()?;
+    }
+    Ok(())
+}
+
 fn copy_page(page: &Page) -> Page {
     let mut out = Page::zeroed();
     out.data_mut().copy_from_slice(page.data());
@@ -528,6 +598,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-buf-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -539,6 +610,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 
@@ -1029,5 +1101,122 @@ mod tests {
         assert_eq!(dirty_of(&pool, id), Some(true));
         let err = error_of(pool.rollback_to_savepoint());
         assert_eq!(err.to_string(), "no savepoint");
+    }
+
+    #[test]
+    fn clean_flush_does_not_touch_the_wal_or_the_database() {
+        let db = TempDb::new("cleanwal");
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        let id = pool.allocate_page().unwrap();
+        pool.write_page(id, &marked(1)).unwrap();
+        pool.flush().unwrap();
+        let db_bytes = fs::read(db.path()).unwrap();
+        let wal_bytes = fs::read(crate::wal::wal_path(db.path())).unwrap();
+        assert_eq!(wal_bytes.len(), crate::wal::HEADER_LEN);
+        pool.flush().unwrap();
+        assert_eq!(fs::read(db.path()).unwrap(), db_bytes);
+        assert_eq!(
+            fs::read(crate::wal::wal_path(db.path())).unwrap(),
+            wal_bytes
+        );
+    }
+
+    #[test]
+    fn recovery_replays_truncates_and_is_idempotent() {
+        let db = TempDb::new("replay");
+        let mut pool = BufferPool::open(db.path(), 4).unwrap();
+        let id = pool.allocate_page().unwrap();
+        pool.write_page(id, &marked(1)).unwrap();
+        pool.flush().unwrap();
+        drop(pool);
+
+        let updated = marked(2);
+        let created = marked(3);
+        {
+            let mut wal = crate::wal::Wal::open(db.path()).unwrap();
+            wal.append_commit(&[(PageId(1), &updated), (PageId(2), &created)], 3)
+                .unwrap();
+        }
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        assert_eq!(pool.page_count().unwrap(), 3);
+        assert_eq!(pool.read_page(PageId(1)).unwrap().data()[0], 2);
+        assert_eq!(pool.read_page(PageId(2)).unwrap().data()[0], 3);
+        assert_eq!(
+            fs::metadata(crate::wal::wal_path(db.path())).unwrap().len(),
+            crate::wal::HEADER_LEN as u64
+        );
+        drop(pool);
+
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        assert_eq!(pool.read_page(PageId(1)).unwrap().data()[0], 2);
+        assert_eq!(pool.read_page(PageId(2)).unwrap().data()[PAGE_SIZE - 1], 3);
+        let bytes = fs::read(db.path()).unwrap();
+        drop(pool);
+        let pool = BufferPool::open(db.path(), 1).unwrap();
+        assert_eq!(fs::read(db.path()).unwrap(), bytes);
+        drop(pool);
+    }
+
+    #[test]
+    fn recovery_truncates_the_file_to_the_commit_page_count() {
+        let db = TempDb::new("shrinkfile");
+        let mut pool = BufferPool::open(db.path(), 4).unwrap();
+        for byte in 1..=3 {
+            let id = pool.allocate_page().unwrap();
+            pool.write_page(id, &marked(byte)).unwrap();
+        }
+        pool.flush().unwrap();
+        assert_eq!(pool.page_count().unwrap(), 4);
+        drop(pool);
+
+        let kept = marked(9);
+        {
+            let mut wal = crate::wal::Wal::open(db.path()).unwrap();
+            wal.append_commit(&[(PageId(1), &kept)], 2).unwrap();
+        }
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        assert_eq!(pool.page_count().unwrap(), 2);
+        assert_eq!(pool.read_page(PageId(1)).unwrap().data()[0], 9);
+        let err = error_of(pool.read_page(PageId(2)));
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+    }
+
+    #[test]
+    fn recovery_discards_a_torn_tail_so_the_next_commit_is_visible() {
+        let db = TempDb::new("tornwal");
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        let id = pool.allocate_page().unwrap();
+        pool.write_page(id, &marked(1)).unwrap();
+        pool.flush().unwrap();
+        drop(pool);
+
+        {
+            let mut file = fs::OpenOptions::new()
+                .append(true)
+                .open(crate::wal::wal_path(db.path()))
+                .unwrap();
+            use std::io::Write;
+            file.write_all(b"torn-tail").unwrap();
+        }
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 1);
+        assert_eq!(
+            fs::metadata(crate::wal::wal_path(db.path())).unwrap().len(),
+            crate::wal::HEADER_LEN as u64
+        );
+        drop(pool);
+
+        let next = marked(4);
+        {
+            let mut wal = crate::wal::Wal::open(db.path()).unwrap();
+            wal.append_commit(&[(id, &next)], 2).unwrap();
+        }
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 4);
+        assert_eq!(pool.read_page(id).unwrap().data()[PAGE_SIZE - 1], 4);
+        assert_eq!(
+            fs::metadata(crate::wal::wal_path(db.path())).unwrap().len(),
+            crate::wal::HEADER_LEN as u64
+        );
     }
 }
