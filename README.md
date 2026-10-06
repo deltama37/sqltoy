@@ -11,6 +11,7 @@ are in `docs/adr/`:
 - ADR-0005 fixes table page ownership and the catalog record format.
 - ADR-0006 fixes row encoding and table operations.
 - ADR-0007 fixes the SQL lexer, grammar, and AST.
+- ADR-0008 fixes SQL execution rules and the CLI.
 
 ## Status
 
@@ -27,13 +28,59 @@ typed rows, including NULL, can be inserted, scanned, updated, and deleted.
 An update that no longer fits on its page is stored at a new record id. The
 SQL parser (ADR-0002 step 6, per ADR-0007) is done: `CREATE TABLE`, `INSERT`,
 `SELECT`, `UPDATE`, and `DELETE` parse into an AST, including `WHERE` and
-expressions. The executor is not implemented yet.
+expressions. The executor (ADR-0002 step 7, per ADR-0008) is done: those
+statements run from the library and from `sqltoy sql` / `sqltoy repl`. This
+is the first SQL milestone.
 
 ## Build and test
 
 ```bash
 cargo build
 cargo test
+```
+
+## SQL
+
+`sql` runs statements against a database file and prints each result. This is
+the first milestone: create a table, insert a row, and read it back.
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-sql.db "CREATE TABLE users (id INTEGER, name TEXT); INSERT INTO users VALUES (1, 'Alice'); SELECT * FROM users"
+```
+
+```text
+CREATE TABLE
+INSERT 1
+ id | name  
+----+-------
+  1 | Alice 
+(1 row)
+```
+
+`repl` reads SQL from stdin. A statement runs when the buffer, ignoring
+trailing whitespace, ends with `;`. `.quit` or `.exit` ends the session when
+no statement is in progress. Piped input is not a terminal, so it prints no
+prompt:
+
+```bash
+cargo run --quiet -- repl /tmp/sqltoy-repl.db <<'EOF'
+CREATE TABLE users (
+  id INTEGER,
+  name TEXT
+);
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+SELECT * FROM users WHERE id = 1;
+.quit
+EOF
+```
+
+```text
+CREATE TABLE
+INSERT 2
+ id | name  
+----+-------
+  1 | Alice 
+(1 row)
 ```
 
 ## Storage CLI

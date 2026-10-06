@@ -9,10 +9,11 @@ use std::io::{self, ErrorKind};
 use crate::catalog::{ColumnType, TableSchema};
 use crate::record::{RecordId, MAX_RECORD_SIZE};
 
-/// One column value.
+/// One stored column value, or a boolean produced by an expression.
 ///
-/// Display prints `NULL`, the integer in decimal, or the text in SQL single
-/// quotes with each embedded `'` doubled.
+/// Display prints `NULL`, the integer in decimal, text in SQL single quotes
+/// with each embedded `'` doubled, or `TRUE` / `FALSE`. A boolean is not a
+/// column type and cannot be stored.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Value {
     /// SQL NULL. Allowed in every column.
@@ -21,6 +22,8 @@ pub enum Value {
     Integer(i64),
     /// UTF-8 text.
     Text(String),
+    /// `TRUE` or `FALSE`. An expression result, never a stored column.
+    Boolean(bool),
 }
 
 impl fmt::Display for Value {
@@ -29,6 +32,8 @@ impl fmt::Display for Value {
             Value::Null => f.write_str("NULL"),
             Value::Integer(value) => write!(f, "{value}"),
             Value::Text(value) => write!(f, "'{}'", value.replace('\'', "''")),
+            Value::Boolean(true) => f.write_str("TRUE"),
+            Value::Boolean(false) => f.write_str("FALSE"),
         }
     }
 }
@@ -37,7 +42,8 @@ impl fmt::Display for Value {
 ///
 /// The value count must match the column count. NULL is allowed in every
 /// column. An integer is stored only in an `INTEGER` column and text only in
-/// a `TEXT` column. There is no implicit conversion.
+/// a `TEXT` column. A boolean is a type mismatch for both. There is no
+/// implicit conversion.
 ///
 /// The bytes are a null bitmap of `ceil(n / 8)` bytes, then the non-null
 /// values in column order. Column `i` is bit `i % 8` of byte `i / 8`, with
@@ -79,7 +85,7 @@ pub fn encode_row(schema: &TableSchema, values: &[Value]) -> io::Result<Vec<u8>>
             set_null(&mut bytes, index);
         }
     }
-    for value in values {
+    for (column, value) in schema.columns.iter().zip(values) {
         match value {
             Value::Null => {}
             Value::Integer(n) => bytes.extend_from_slice(&n.to_le_bytes()),
@@ -87,6 +93,16 @@ pub fn encode_row(schema: &TableSchema, values: &[Value]) -> io::Result<Vec<u8>>
                 let len = u16::try_from(text.len()).map_err(|_| row_too_large(&schema.name))?;
                 bytes.extend_from_slice(&len.to_le_bytes());
                 bytes.extend_from_slice(text.as_bytes());
+            }
+            // value_matches rejects booleans before this loop.
+            Value::Boolean(_) => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    format!(
+                        "type mismatch for column {}: expected {}",
+                        column.name, column.column_type
+                    ),
+                ));
             }
         }
     }
@@ -258,6 +274,8 @@ mod tests {
         assert_eq!(Value::Text("'".to_string()).to_string(), "''''");
         assert_eq!(Value::Text("a'b'c".to_string()).to_string(), "'a''b''c'");
         assert_eq!(Value::Text("NULL".to_string()).to_string(), "'NULL'");
+        assert_eq!(Value::Boolean(true).to_string(), "TRUE");
+        assert_eq!(Value::Boolean(false).to_string(), "FALSE");
     }
 
     #[test]
@@ -407,6 +425,45 @@ mod tests {
         let err = encode_row(
             &users(),
             &[Value::Null, Value::Null, Value::Text("x".to_string())],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type mismatch for column age: expected INTEGER"
+        );
+
+        let err = encode_row(
+            &users(),
+            &[
+                Value::Boolean(true),
+                Value::Text("y".to_string()),
+                Value::Integer(1),
+            ],
+        )
+        .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(
+            err.to_string(),
+            "type mismatch for column id: expected INTEGER"
+        );
+
+        let err = encode_row(
+            &users(),
+            &[Value::Integer(1), Value::Boolean(false), Value::Integer(1)],
+        )
+        .unwrap_err();
+        assert_eq!(
+            err.to_string(),
+            "type mismatch for column name: expected TEXT"
+        );
+
+        let err = encode_row(
+            &users(),
+            &[
+                Value::Null,
+                Value::Text("y".to_string()),
+                Value::Boolean(true),
+            ],
         )
         .unwrap_err();
         assert_eq!(
