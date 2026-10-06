@@ -13,6 +13,8 @@ are in `docs/adr/`:
 - ADR-0007 fixes the SQL lexer, grammar, and AST.
 - ADR-0008 fixes SQL execution rules and the CLI.
 - ADR-0009 fixes the primary key and the B+Tree index page format.
+- ADR-0010 fixes operator-based query execution, including `ORDER BY`,
+  `LIMIT` / `OFFSET`, and `JOIN`.
 
 ## Status
 
@@ -34,7 +36,12 @@ statements run from the library and from `sqltoy sql` / `sqltoy repl`. This
 is the first SQL milestone. The primary-key index (ADR-0002 step 8, per
 ADR-0009) is done. An `INTEGER` column marked `PRIMARY KEY` is unique and
 not NULL, and `WHERE id = 1` reads that one row from a B+Tree instead of
-scanning the table.
+scanning the table. Query execution (ADR-0002 step 9, per ADR-0010) is
+done. A `SELECT` is a tree of operators: a sequential scan reads one page
+at a time, an index lookup replaces that scan when a primary key is a
+constant equality, and `JOIN`, `ORDER BY`, and `LIMIT` / `OFFSET` are a
+nested-loop join, a stable sort, and a limit. `LIMIT` stops the scan once
+it has enough rows. A comma in `FROM` is a cross join.
 
 ## Build and test
 
@@ -76,8 +83,48 @@ error: duplicate primary key: 1
 
 `Database::pages_read` counts pages read since the database was opened. A
 primary-key equality reads a handful of pages (the tree height, plus the
-row). A query without that equality reads every page. The counter is not
-exposed by the CLI.
+row). A query without that equality reads every page. `SELECT * FROM t
+LIMIT 1` on a table that spans dozens of pages reads one or two pages and
+then stops. The counter is not exposed by the CLI.
+
+A left join keeps unmatched left rows and fills the right side with `NULL`.
+`ORDER BY` is stable, and `NULL` sorts first in `ASC` and last in `DESC`.
+`LIMIT` is applied after the sort. `Cam` has no order, so the right-hand
+`sku` would be `NULL`; `LIMIT 3` stops before that row:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-query.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); CREATE TABLE orders (id INTEGER PRIMARY KEY, user_id INTEGER, sku TEXT); INSERT INTO users VALUES (1, 'Bob'), (2, 'Ann'), (3, 'Cam'); INSERT INTO orders VALUES (10, 1, 'pen'), (11, 2, 'cup'), (12, 1, 'mug'); SELECT users.name, orders.sku FROM users LEFT JOIN orders ON users.id = orders.user_id ORDER BY users.name, orders.sku LIMIT 3"
+```
+
+```text
+CREATE TABLE
+CREATE TABLE
+INSERT 3
+INSERT 3
+ name | sku 
+------+-----
+ Ann  | cup 
+ Bob  | mug 
+ Bob  | pen 
+(3 rows)
+```
+
+The next statement skips the leading `NULL` name, then keeps two rows. The
+two rows named `a` stay in `id DESC` order:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-order.db "CREATE TABLE t (id INTEGER, name TEXT); INSERT INTO t VALUES (1, 'a'), (2, NULL), (3, 'b'), (4, 'a'); SELECT id, name FROM t ORDER BY name, id DESC LIMIT 2 OFFSET 1"
+```
+
+```text
+CREATE TABLE
+INSERT 4
+ id | name 
+----+------
+  4 | a    
+  1 | a    
+(2 rows)
+```
 
 `repl` reads SQL from stdin. A statement runs when the buffer, ignoring
 trailing whitespace, ends with `;`. `.quit` or `.exit` ends the session when

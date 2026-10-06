@@ -10,8 +10,8 @@ use std::io;
 use crate::catalog::ColumnType;
 
 use super::ast::{
-    Assignment, BinaryOp, ColumnDef, ColumnRef, CreateTable, Delete, Expr, Insert, Literal, Select,
-    SelectItem, Statement, UnaryOp, Update,
+    Assignment, BinaryOp, ColumnDef, ColumnRef, CreateTable, Delete, Expr, FromItem, Insert, Join,
+    JoinKind, Literal, OrderItem, Select, SelectItem, Statement, TableRef, UnaryOp, Update,
 };
 use super::lexer::{syntax_error, tokenize, Keyword, Token, TokenKind};
 
@@ -148,18 +148,29 @@ impl Parser {
         self.expect_keyword(Keyword::Select)?;
         let items = self.parse_list(|parser| parser.parse_select_item())?;
         self.expect_keyword(Keyword::From)?;
-        let from = self.expect_ident()?;
+        let from = self.parse_from_item()?;
         let filter = self.parse_optional_where()?;
+        let order_by = self.parse_order_by()?;
+        let (limit, offset) = self.parse_limit()?;
         Ok(Select {
             items,
             from,
             filter,
+            order_by,
+            limit,
+            offset,
         })
     }
 
     fn parse_select_item(&mut self) -> io::Result<SelectItem> {
         if self.eat(TokenKind::Star) {
             return Ok(SelectItem::Wildcard);
+        }
+        if self.qualified_wildcard() {
+            let name = self.expect_ident()?;
+            self.expect(TokenKind::Dot, "'.'")?;
+            self.expect(TokenKind::Star, "'*'")?;
+            return Ok(SelectItem::QualifiedWildcard(name));
         }
         let expr = self.parse_expr()?;
         let alias = if self.at_keyword(Keyword::As) || matches!(self.kind(), TokenKind::Ident(_)) {
@@ -169,6 +180,112 @@ impl Parser {
             None
         };
         Ok(SelectItem::Expr { expr, alias })
+    }
+
+    /// `ident '.' '*'` is a qualified wildcard, not a column reference.
+    fn qualified_wildcard(&self) -> bool {
+        matches!(self.kind(), TokenKind::Ident(_))
+            && matches!(self.peek_kind(1), Some(TokenKind::Dot))
+            && matches!(self.peek_kind(2), Some(TokenKind::Star))
+    }
+
+    fn parse_from_item(&mut self) -> io::Result<FromItem> {
+        let first = self.parse_table_ref()?;
+        let mut joins = Vec::new();
+        while let Some(join) = self.parse_join()? {
+            joins.push(join);
+        }
+        Ok(FromItem { first, joins })
+    }
+
+    fn parse_table_ref(&mut self) -> io::Result<TableRef> {
+        let table = self.expect_ident()?;
+        let alias = if self.at_keyword(Keyword::As) || matches!(self.kind(), TokenKind::Ident(_)) {
+            self.eat_keyword(Keyword::As);
+            Some(self.expect_ident()?)
+        } else {
+            None
+        };
+        Ok(TableRef { table, alias })
+    }
+
+    /// Parses one join, or returns `Ok(None)` when the next token is not a join.
+    fn parse_join(&mut self) -> io::Result<Option<Join>> {
+        if self.eat(TokenKind::Comma) {
+            let table = self.parse_table_ref()?;
+            return Ok(Some(Join {
+                kind: JoinKind::Cross,
+                table,
+                on: None,
+            }));
+        }
+        if self.eat_keyword(Keyword::Cross) {
+            self.expect_keyword(Keyword::Join)?;
+            let table = self.parse_table_ref()?;
+            if self.at_keyword(Keyword::On) {
+                return Err(self.error_here("CROSS JOIN cannot have ON"));
+            }
+            return Ok(Some(Join {
+                kind: JoinKind::Cross,
+                table,
+                on: None,
+            }));
+        }
+        let kind = if self.eat_keyword(Keyword::Inner) {
+            self.expect_keyword(Keyword::Join)?;
+            JoinKind::Inner
+        } else if self.eat_keyword(Keyword::Left) {
+            self.eat_keyword(Keyword::Outer);
+            self.expect_keyword(Keyword::Join)?;
+            JoinKind::Left
+        } else if self.eat_keyword(Keyword::Join) {
+            JoinKind::Inner
+        } else {
+            return Ok(None);
+        };
+        let table = self.parse_table_ref()?;
+        self.expect_keyword(Keyword::On)?;
+        let on = self.parse_expr()?;
+        Ok(Some(Join {
+            kind,
+            table,
+            on: Some(on),
+        }))
+    }
+
+    fn parse_order_by(&mut self) -> io::Result<Vec<OrderItem>> {
+        if !self.eat_keyword(Keyword::Order) {
+            return Ok(Vec::new());
+        }
+        self.expect_keyword(Keyword::By)?;
+        self.parse_list(|parser| parser.parse_order_item())
+    }
+
+    fn parse_order_item(&mut self) -> io::Result<OrderItem> {
+        let expr = self.parse_expr()?;
+        let descending = if self.eat_keyword(Keyword::Desc) {
+            true
+        } else {
+            self.eat_keyword(Keyword::Asc);
+            false
+        };
+        Ok(OrderItem { expr, descending })
+    }
+
+    fn parse_limit(&mut self) -> io::Result<(Option<Expr>, Option<Expr>)> {
+        if self.at_keyword(Keyword::Offset) {
+            return Err(self.error_here("OFFSET requires LIMIT"));
+        }
+        if !self.eat_keyword(Keyword::Limit) {
+            return Ok((None, None));
+        }
+        let limit = self.parse_expr()?;
+        let offset = if self.eat_keyword(Keyword::Offset) {
+            Some(self.parse_expr()?)
+        } else {
+            None
+        };
+        Ok((Some(limit), offset))
     }
 
     fn parse_update(&mut self) -> io::Result<Update> {
@@ -405,6 +522,12 @@ impl Parser {
         &self.tokens[self.index].kind
     }
 
+    fn peek_kind(&self, offset: usize) -> Option<&TokenKind> {
+        self.tokens
+            .get(self.index + offset)
+            .map(|token| &token.kind)
+    }
+
     fn current(&self) -> &Token {
         &self.tokens[self.index]
     }
@@ -480,7 +603,8 @@ mod tests {
     use crate::catalog::ColumnType;
     use crate::sql::{
         format_statements, Assignment, BinaryOp, ColumnDef, ColumnRef, CreateTable, Delete, Expr,
-        Insert, Literal, Select, SelectItem, Statement, UnaryOp, Update,
+        FromItem, Insert, Join, JoinKind, Literal, OrderItem, Select, SelectItem, Statement,
+        TableRef, UnaryOp, Update,
     };
     use std::io::ErrorKind;
 
@@ -528,6 +652,16 @@ mod tests {
             err.to_string(),
             format!("syntax error at {line}:{column}: {message}")
         );
+    }
+
+    fn from_name(name: &str) -> FromItem {
+        FromItem {
+            first: TableRef {
+                table: name.to_string(),
+                alias: None,
+            },
+            joins: Vec::new(),
+        }
     }
 
     fn col(name: &str) -> Expr {
@@ -668,8 +802,11 @@ mod tests {
             parse_one("SELECT * FROM users"),
             Statement::Select(Select {
                 items: vec![SelectItem::Wildcard],
-                from: "users".to_string(),
+                from: from_name("users"),
                 filter: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             })
         );
         assert_eq!(
@@ -689,16 +826,22 @@ mod tests {
                         alias: None,
                     },
                 ],
-                from: "Users".to_string(),
+                from: from_name("Users"),
                 filter: None,
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             })
         );
         assert_eq!(
             parse_one("select * from t where id = 1"),
             Statement::Select(Select {
                 items: vec![SelectItem::Wildcard],
-                from: "t".to_string(),
+                from: from_name("t"),
                 filter: Some(bin(BinaryOp::Eq, col("id"), lit_int(1))),
+                order_by: Vec::new(),
+                limit: None,
+                offset: None,
             })
         );
 
@@ -941,10 +1084,10 @@ DELETE FROM users";
             "expected identifier, found SELECT",
         );
         assert_parse_err(
-            "SELECT * FROM t garbage",
+            "SELECT * FROM t garbage extra",
             1,
-            17,
-            "expected ';', found identifier \"garbage\"",
+            25,
+            "expected ';', found identifier \"extra\"",
         );
         assert_parse_err(
             "SELECT * FROM",
@@ -974,8 +1117,32 @@ DELETE FROM users";
             "expected type, found identifier \"BLOB\"",
         );
         assert_parse_err("SELECT 1.2 FROM t", 1, 9, "expected FROM, found '.'");
-        assert_parse_err("SELECT t.* FROM t", 1, 10, "expected identifier, found '*'");
         assert_parse_err("SELECT * AS a FROM t", 1, 10, "expected FROM, found AS");
+        assert_parse_err(
+            "SELECT * FROM a INNER JOIN b",
+            1,
+            29,
+            "expected ON, found end of input",
+        );
+        assert_parse_err(
+            "SELECT * FROM a JOIN b WHERE id = 1",
+            1,
+            24,
+            "expected ON, found WHERE",
+        );
+        assert_parse_err(
+            "SELECT * FROM a CROSS JOIN b ON a.id = b.id",
+            1,
+            30,
+            "CROSS JOIN cannot have ON",
+        );
+        assert_parse_err("SELECT * FROM t OFFSET 1", 1, 17, "OFFSET requires LIMIT");
+        assert_parse_err(
+            "SELECT * FROM t ORDER BY a OFFSET 1",
+            1,
+            28,
+            "OFFSET requires LIMIT",
+        );
         assert_parse_err(
             "SELECT a = NOT b FROM t",
             1,
@@ -1053,11 +1220,97 @@ DELETE FROM users";
             "-- c\nSELECT * FROM t -- tail",
             "SELECT NOT NULL FROM t",
             "SELECT (1 + 2) * - 3 FROM t",
+            "SELECT t.*, u.id FROM t AS u",
+            "SELECT * FROM users u",
+            "SELECT * FROM users AS u",
+            "SELECT * FROM a INNER JOIN b ON a.id = b.id",
+            "SELECT * FROM a JOIN b ON a.id = b.a_id",
+            "SELECT * FROM a LEFT JOIN b ON a.id = b.id",
+            "SELECT * FROM a LEFT OUTER JOIN b ON a.id = b.id",
+            "SELECT * FROM a CROSS JOIN b",
+            "SELECT * FROM a, b",
+            "SELECT * FROM a AS x, b y",
+            "SELECT * FROM t ORDER BY a",
+            "SELECT * FROM t ORDER BY a DESC, b ASC",
+            "SELECT * FROM t ORDER BY a DESC, b",
+            "SELECT * FROM t LIMIT 10",
+            "SELECT * FROM t LIMIT 10 OFFSET 5",
+            "SELECT * FROM t WHERE id = 1 ORDER BY name DESC LIMIT 2 OFFSET 1",
+            "SELECT a.id, b.name FROM a AS a INNER JOIN b ON a.id = b.id",
+            "SELECT * FROM a JOIN b ON a.id = b.id JOIN c ON b.id = c.id",
         ];
         assert!(corpus.len() >= 20);
         for sql in corpus {
             assert_round_trip(sql);
         }
+    }
+
+    #[test]
+    fn joins_order_by_and_limit_parse_and_display() {
+        assert_eq!(
+            parse_one("SELECT t.* FROM users u ORDER BY name DESC, 2 ASC LIMIT 1 + 2 OFFSET 4"),
+            Statement::Select(Select {
+                items: vec![SelectItem::QualifiedWildcard("t".to_string())],
+                from: FromItem {
+                    first: TableRef {
+                        table: "users".to_string(),
+                        alias: Some("u".to_string()),
+                    },
+                    joins: Vec::new(),
+                },
+                filter: None,
+                order_by: vec![
+                    OrderItem {
+                        expr: col("name"),
+                        descending: true,
+                    },
+                    OrderItem {
+                        expr: lit_int(2),
+                        descending: false,
+                    },
+                ],
+                limit: Some(bin(BinaryOp::Add, lit_int(1), lit_int(2))),
+                offset: Some(lit_int(4)),
+            })
+        );
+        let joined = parse_one(
+            "SELECT * FROM a INNER JOIN b AS bb ON a.id = bb.id LEFT OUTER JOIN c ON bb.id = c.id, d",
+        );
+        let Statement::Select(select) = joined else {
+            panic!("expected select");
+        };
+        assert_eq!(select.from.joins.len(), 3);
+        assert_eq!(select.from.joins[0].kind, JoinKind::Inner);
+        assert_eq!(select.from.joins[1].kind, JoinKind::Left);
+        assert_eq!(select.from.joins[2].kind, JoinKind::Cross);
+        assert!(select.from.joins[2].on.is_none());
+        assert_eq!(
+            select.to_string(),
+            "SELECT * FROM a INNER JOIN b AS bb ON (a.id = bb.id) LEFT JOIN c ON (bb.id = c.id) CROSS JOIN d"
+        );
+        assert_eq!(
+            parse_one("SELECT * FROM a, b").to_string(),
+            "SELECT * FROM a CROSS JOIN b"
+        );
+        assert_eq!(
+            parse_one("SELECT id user_id FROM t ORDER BY id ASC").to_string(),
+            "SELECT id AS user_id FROM t ORDER BY id"
+        );
+        let on = parse_one("SELECT * FROM a JOIN b ON a = 1 AND b = 2");
+        let Statement::Select(select) = on else {
+            panic!("expected select");
+        };
+        let Join { on: Some(expr), .. } = &select.from.joins[0] else {
+            panic!("expected ON");
+        };
+        assert_eq!(
+            expr,
+            &bin(
+                BinaryOp::And,
+                bin(BinaryOp::Eq, col("a"), lit_int(1)),
+                bin(BinaryOp::Eq, col("b"), lit_int(2)),
+            )
+        );
     }
 
     fn assert_round_trip(sql: &str) {

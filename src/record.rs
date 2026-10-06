@@ -208,21 +208,50 @@ impl RecordFile {
     /// [`TableId`] `0` is [`ErrorKind::InvalidInput`].
     pub fn scan(&mut self, table: TableId) -> io::Result<Vec<(RecordId, Vec<u8>)>> {
         require_table(table)?;
-        let count = self.pages.page_count()?;
         let mut records = Vec::new();
-        for raw_id in 1..count {
-            let page_id = PageId(raw_id);
-            let Some(slotted) = self.read_record_page_or_skip(page_id)? else {
-                continue;
-            };
-            if slotted.owner() != table {
-                continue;
-            }
-            for (slot_id, bytes) in slotted.iter_live() {
-                records.push((RecordId { page_id, slot_id }, bytes.to_vec()));
+        let mut page_id = 1u32;
+        loop {
+            match self.scan_page(table, PageId(page_id))? {
+                None => return Ok(records),
+                Some(page) => {
+                    records.extend(page);
+                    page_id += 1;
+                }
             }
         }
-        Ok(records)
+    }
+
+    /// Live records on one page owned by `table`.
+    ///
+    /// `Ok(None)` when `page_id` is past the last page. `Ok(Some(vec))` when
+    /// that page was considered: the vec is empty when the page is a B+Tree
+    /// node or belongs to another table. Page 0 is empty and is not read.
+    /// No other page is read. [`TableId`] `0` is [`ErrorKind::InvalidInput`].
+    #[allow(clippy::type_complexity)]
+    pub fn scan_page(
+        &mut self,
+        table: TableId,
+        page_id: PageId,
+    ) -> io::Result<Option<Vec<(RecordId, Vec<u8>)>>> {
+        require_table(table)?;
+        if page_id == PageId(0) {
+            return Ok(Some(Vec::new()));
+        }
+        let count = self.pages.page_count()?;
+        if page_id.0 >= count {
+            return Ok(None);
+        }
+        let Some(slotted) = self.read_record_page_or_skip(page_id)? else {
+            return Ok(Some(Vec::new()));
+        };
+        if slotted.owner() != table {
+            return Ok(Some(Vec::new()));
+        }
+        let records = slotted
+            .iter_live()
+            .map(|(slot_id, bytes)| (RecordId { page_id, slot_id }, bytes.to_vec()))
+            .collect();
+        Ok(Some(records))
     }
 
     fn read_owned_page(&mut self, table: TableId, id: RecordId) -> io::Result<SlottedPage> {
@@ -399,6 +428,37 @@ mod tests {
             scanned,
             vec![(alice, b"Alicia".to_vec()), (carol, Vec::new())]
         );
+    }
+
+    #[test]
+    fn scan_page_reads_only_the_requested_page() {
+        let db = TempDb::new("scan-page");
+        let mut file = RecordFile::open(db.path()).unwrap();
+        let wide = vec![1u8; 3000];
+        let first = file.insert(TABLE, &wide).unwrap();
+        let second = file.insert(TABLE, &wide).unwrap();
+        assert_ne!(first.page_id, second.page_id);
+
+        let before = file.pages_read();
+        let page = file.scan_page(TABLE, first.page_id).unwrap().unwrap();
+        assert_eq!(page, vec![(first, wide.clone())]);
+        assert_eq!(file.pages_read() - before, 1);
+        assert!(file
+            .scan_page(TABLE, PageId(0))
+            .unwrap()
+            .unwrap()
+            .is_empty());
+        assert_eq!(file.pages_read() - before, 1);
+        assert!(file
+            .scan_page(TABLE, PageId(second.page_id.0 + 5))
+            .unwrap()
+            .is_none());
+        assert_eq!(file.pages_read() - before, 1);
+
+        let other = TableId(3);
+        let foreign = file.insert(other, b"x").unwrap();
+        let skipped = file.scan_page(TABLE, foreign.page_id).unwrap().unwrap();
+        assert!(skipped.is_empty());
     }
 
     #[test]

@@ -3,20 +3,19 @@
 //! `INSERT` and `UPDATE` evaluate and encode every candidate row before the
 //! first write. `UPDATE` reads the old row for every assignment, so
 //! `SET a = b, b = a` swaps. Rows are collected before they are changed, so
-//! a row that moves to another page is not processed twice.
+//! a row that moves to another page is not processed twice. `SELECT` pulls
+//! from an operator tree.
 
 use std::io::{self, ErrorKind};
 
-use crate::btree::BTree;
 use crate::catalog::{ColumnSpec, Database, TableSchema};
 use crate::record::RecordId;
 use crate::row::Value;
-use crate::sql::{
-    Assignment, BinaryOp, ColumnRef, CreateTable, Delete, Expr, Insert, Select, SelectItem,
-    Statement, Update,
-};
+use crate::sql::{Assignment, CreateTable, Delete, Expr, Insert, Select, Statement, Update};
 
-use super::eval::{bind_expr, column_not_found, eval, invalid, resolve_column, RowContext};
+use super::eval::{bind_expr, column_not_found, eval, invalid, Binding, RowContext};
+use super::operator::instantiate;
+use super::plan::{compile_modify, compile_select};
 
 /// The outcome of one SQL statement.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -47,6 +46,11 @@ impl Database {
     /// before rows are read, so a missing column fails even when the table
     /// is empty. `INSERT` values are evaluated with no row, so a column
     /// reference there is `column not found`.
+    ///
+    /// `SELECT` pulls from a scan, then joins, filter, project, sort, and
+    /// limit. `ORDER BY` is stable. `LIMIT` stops the scan once it has
+    /// enough rows. `UPDATE` and `DELETE` use the same scan and filter to
+    /// choose rows.
     ///
     /// An unknown table is [`ErrorKind::NotFound`] (`table not found: {name}`).
     /// A bad column, value, or expression is [`ErrorKind::InvalidInput`].
@@ -105,10 +109,13 @@ impl Database {
                 )));
             }
         }
-        let ctx = RowContext {
-            table: &schema.name,
-            columns: &schema.columns,
+        let binding = Binding {
+            name: schema.name.as_str(),
+            columns: schema.columns.as_slice(),
             values: None,
+        };
+        let ctx = RowContext {
+            bindings: &[binding],
         };
         let mut pending = Vec::with_capacity(insert.rows.len());
         for row in &insert.rows {
@@ -132,17 +139,17 @@ impl Database {
         if let Some(filter) = &update.filter {
             bind_expr(&schema.name, &schema.columns, filter)?;
         }
-        let scanned = candidate_rows(self, &schema, update.filter.as_ref())?;
+        let scanned = self.matching_rows(&schema, update.filter.as_ref())?;
         let mut pending = Vec::new();
         for (id, old) in &scanned {
-            let ctx = RowContext {
-                table: &schema.name,
-                columns: &schema.columns,
+            let binding = Binding {
+                name: schema.name.as_str(),
+                columns: schema.columns.as_slice(),
                 values: Some(old),
             };
-            if !matches_where(update.filter.as_ref(), &ctx)? {
-                continue;
-            }
+            let ctx = RowContext {
+                bindings: &[binding],
+            };
             let mut new_values = old.clone();
             for (index, assignment) in targets.iter().zip(&update.assignments) {
                 new_values[*index] = eval(&assignment.value, &ctx)?;
@@ -158,17 +165,10 @@ impl Database {
         if let Some(filter) = &delete.filter {
             bind_expr(&schema.name, &schema.columns, filter)?;
         }
-        let scanned = candidate_rows(self, &schema, delete.filter.as_ref())?;
+        let scanned = self.matching_rows(&schema, delete.filter.as_ref())?;
         let mut ids = Vec::new();
-        for (id, values) in &scanned {
-            let ctx = RowContext {
-                table: &schema.name,
-                columns: &schema.columns,
-                values: Some(values),
-            };
-            if matches_where(delete.filter.as_ref(), &ctx)? {
-                ids.push(*id);
-            }
+        for (id, _) in &scanned {
+            ids.push(*id);
         }
         for id in &ids {
             self.delete(&schema.name, *id)?;
@@ -177,33 +177,40 @@ impl Database {
     }
 
     fn execute_select(&mut self, select: &Select) -> io::Result<QueryResult> {
-        let schema = require_table(self, &select.from)?;
-        let plan = select_plan(&schema, &select.items)?;
-        for (_, expr) in &plan {
-            bind_expr(&schema.name, &schema.columns, expr)?;
-        }
-        if let Some(filter) = &select.filter {
-            bind_expr(&schema.name, &schema.columns, filter)?;
-        }
-        let scanned = candidate_rows(self, &schema, select.filter.as_ref())?;
+        let compiled = compile_select(self, select)?;
+        let mut operator = instantiate(compiled.plan);
         let mut rows = Vec::new();
-        for (_, values) in &scanned {
-            let ctx = RowContext {
-                table: &schema.name,
-                columns: &schema.columns,
-                values: Some(values),
-            };
-            if !matches_where(select.filter.as_ref(), &ctx)? {
-                continue;
-            }
-            let mut projected = Vec::with_capacity(plan.len());
-            for (_, expr) in &plan {
-                projected.push(eval(expr, &ctx)?);
-            }
-            rows.push(projected);
+        while let Some(tuple) = operator.next(self)? {
+            rows.push(tuple.projected);
         }
-        let columns = plan.into_iter().map(|(name, _)| name).collect();
-        Ok(QueryResult::Rows { columns, rows })
+        Ok(QueryResult::Rows {
+            columns: compiled.columns,
+            rows,
+        })
+    }
+
+    /// Operator tree for a `SELECT`, one line per operator.
+    ///
+    /// `EXPLAIN` will print this. The tree is the same one [`Self::execute_statement`]
+    /// runs.
+    pub fn describe_select(&self, select: &Select) -> io::Result<String> {
+        Ok(compile_select(self, select)?.plan.describe())
+    }
+
+    fn matching_rows(
+        &mut self,
+        schema: &TableSchema,
+        filter: Option<&Expr>,
+    ) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
+        let plan = compile_modify(schema, filter)?;
+        let mut operator = instantiate(plan);
+        let mut rows = Vec::new();
+        while let Some(tuple) = operator.next(self)? {
+            let slot = &tuple.bindings[0];
+            let id = slot.id.ok_or_else(|| invalid("missing record id"))?;
+            rows.push((id, slot.values.clone()));
+        }
+        Ok(rows)
     }
 }
 
@@ -211,130 +218,6 @@ fn require_table(db: &Database, name: &str) -> io::Result<TableSchema> {
     db.table(name)
         .cloned()
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, format!("table not found: {name}")))
-}
-
-fn candidate_rows(
-    db: &mut Database,
-    schema: &TableSchema,
-    filter: Option<&Expr>,
-) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
-    if let Some(filter) = filter {
-        if let Some(key) = index_lookup_key(schema, filter) {
-            return lookup_primary_key(db, schema, key);
-        }
-    }
-    db.scan(&schema.name)
-}
-
-/// Integer from a top-level `pk = const` or `const = pk` conjunct.
-///
-/// `None` means the caller should scan. A constant that is not an integer,
-/// or that fails to evaluate, also returns `None` so the scan reports the
-/// same rows and errors.
-fn index_lookup_key(schema: &TableSchema, filter: &Expr) -> Option<i64> {
-    let pk_index = schema.primary_key?;
-    let pk_name = schema.columns[pk_index].name.as_str();
-    let const_expr = pk_equality_const(filter, &schema.name, pk_name)?;
-    let ctx = RowContext {
-        table: &schema.name,
-        columns: &schema.columns,
-        values: None,
-    };
-    match eval(const_expr, &ctx) {
-        Ok(Value::Integer(key)) => Some(key),
-        _ => None,
-    }
-}
-
-fn lookup_primary_key(
-    db: &mut Database,
-    schema: &TableSchema,
-    key: i64,
-) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
-    let root = schema
-        .index_root
-        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing index root"))?;
-    let tree = BTree::open(root, schema.id);
-    let Some(id) = tree.get(db.records.pages_mut(), key)? else {
-        return Ok(Vec::new());
-    };
-    let values = db.get(&schema.name, id)?;
-    Ok(vec![(id, values)])
-}
-
-fn pk_equality_const<'a>(filter: &'a Expr, table: &str, pk_name: &str) -> Option<&'a Expr> {
-    for conjunct in and_conjuncts(filter) {
-        if let Some(expr) = eq_pk_const(conjunct, table, pk_name) {
-            return Some(expr);
-        }
-    }
-    None
-}
-
-fn and_conjuncts(expr: &Expr) -> Vec<&Expr> {
-    match expr {
-        Expr::Binary {
-            op: BinaryOp::And,
-            left,
-            right,
-        } => {
-            let mut parts = and_conjuncts(left);
-            parts.extend(and_conjuncts(right));
-            parts
-        }
-        other => vec![other],
-    }
-}
-
-fn eq_pk_const<'a>(expr: &'a Expr, table: &str, pk_name: &str) -> Option<&'a Expr> {
-    let Expr::Binary {
-        op: BinaryOp::Eq,
-        left,
-        right,
-    } = expr
-    else {
-        return None;
-    };
-    if is_pk_ref(left, table, pk_name) && !contains_column(right) {
-        Some(right)
-    } else if is_pk_ref(right, table, pk_name) && !contains_column(left) {
-        Some(left)
-    } else {
-        None
-    }
-}
-
-fn is_pk_ref(expr: &Expr, table: &str, pk_name: &str) -> bool {
-    let Expr::Column(reference) = expr else {
-        return false;
-    };
-    if let Some(qualifier) = &reference.table {
-        if !qualifier.eq_ignore_ascii_case(table) {
-            return false;
-        }
-    }
-    reference.column.eq_ignore_ascii_case(pk_name)
-}
-
-fn contains_column(expr: &Expr) -> bool {
-    match expr {
-        Expr::Literal(_) => false,
-        Expr::Column(_) => true,
-        Expr::Unary { expr, .. } => contains_column(expr),
-        Expr::Binary { left, right, .. } => contains_column(left) || contains_column(right),
-        Expr::IsNull { expr, .. } => contains_column(expr),
-    }
-}
-
-fn matches_where(filter: Option<&Expr>, ctx: &RowContext<'_>) -> io::Result<bool> {
-    let Some(filter) = filter else {
-        return Ok(true);
-    };
-    match eval(filter, ctx)? {
-        Value::Boolean(true) => Ok(true),
-        Value::Boolean(false) | Value::Null => Ok(false),
-        _ => Err(invalid("WHERE must be a boolean expression")),
-    }
 }
 
 fn insert_targets(schema: &TableSchema, names: &[String]) -> io::Result<Vec<usize>> {
@@ -385,40 +268,6 @@ fn align_values(
         values[*index] = value;
     }
     values
-}
-
-fn select_plan(schema: &TableSchema, items: &[SelectItem]) -> io::Result<Vec<(String, Expr)>> {
-    let mut plan = Vec::new();
-    for item in items {
-        match item {
-            SelectItem::Wildcard => {
-                for column in &schema.columns {
-                    plan.push((
-                        column.name.clone(),
-                        Expr::Column(ColumnRef {
-                            table: None,
-                            column: column.name.clone(),
-                        }),
-                    ));
-                }
-            }
-            SelectItem::Expr { expr, alias } => {
-                plan.push((output_name(schema, expr, alias)?, expr.clone()));
-            }
-        }
-    }
-    Ok(plan)
-}
-
-fn output_name(schema: &TableSchema, expr: &Expr, alias: &Option<String>) -> io::Result<String> {
-    if let Some(alias) = alias {
-        return Ok(alias.clone());
-    }
-    if let Expr::Column(reference) = expr {
-        let index = resolve_column(&schema.name, &schema.columns, reference)?;
-        return Ok(schema.columns[index].name.clone());
-    }
-    Ok(expr.to_string())
 }
 
 #[cfg(test)]
@@ -1152,5 +1001,446 @@ mod tests {
         exec(&mut database, "INSERT INTO users VALUES (50, 'back')");
         let (_, rows) = query(&mut database, "SELECT name FROM users WHERE id = 50");
         assert_eq!(rows, vec![vec![text("back")]]);
+    }
+
+    #[test]
+    fn order_by_nulls_alias_position_expression_and_stability() {
+        let (_db, mut database) = open("order");
+        exec(
+            &mut database,
+            "CREATE TABLE items (id INTEGER, name TEXT, n INTEGER); \
+             INSERT INTO items VALUES \
+               (1, 'a', 2), \
+               (2, 'b', 1), \
+               (3, 'a', NULL), \
+               (4, NULL, 1), \
+               (5, 'a', 2)",
+        );
+        let (_, rows) = query(
+            &mut database,
+            "SELECT id FROM items ORDER BY name ASC, n DESC, id ASC",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![int(4)],
+                vec![int(1)],
+                vec![int(5)],
+                vec![int(3)],
+                vec![int(2)],
+            ]
+        );
+        let (_, rows) = query(&mut database, "SELECT id FROM items ORDER BY name DESC, id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![int(2)],
+                vec![int(1)],
+                vec![int(3)],
+                vec![int(5)],
+                vec![int(4)],
+            ]
+        );
+
+        let (_, rows) = query(
+            &mut database,
+            "SELECT name AS n, id FROM items ORDER BY n, id",
+        );
+        assert_eq!(rows[0], vec![Value::Null, int(4)]);
+        assert_eq!(rows[1][1], int(1));
+
+        let (_, rows) = query(&mut database, "SELECT name, id FROM items ORDER BY 2 DESC");
+        assert_eq!(rows[0][1], int(5));
+        assert_eq!(rows[4][1], int(1));
+
+        let (_, rows) = query(&mut database, "SELECT name FROM items ORDER BY id DESC");
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("a")],
+                vec![Value::Null],
+                vec![text("a")],
+                vec![text("b")],
+                vec![text("a")],
+            ]
+        );
+
+        let (_, rows) = query(&mut database, "SELECT - id AS id FROM items ORDER BY id");
+        assert_eq!(
+            rows,
+            vec![
+                vec![int(-5)],
+                vec![int(-4)],
+                vec![int(-3)],
+                vec![int(-2)],
+                vec![int(-1)]
+            ]
+        );
+
+        let (_, rows) = query(
+            &mut database,
+            "SELECT id FROM items WHERE name = 'a' ORDER BY name",
+        );
+        assert_eq!(rows, vec![vec![int(1)], vec![int(3)], vec![int(5)]]);
+
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM items ORDER BY 0"),
+            (
+                ErrorKind::InvalidInput,
+                "ORDER BY position out of range: 0".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM items ORDER BY 3"),
+            (
+                ErrorKind::InvalidInput,
+                "ORDER BY position out of range: 3".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM items ORDER BY missing"),
+            (
+                ErrorKind::InvalidInput,
+                "column not found: missing".to_string()
+            )
+        );
+    }
+
+    #[test]
+    fn limit_offset_and_early_stop() {
+        let (_db, mut database) = open("limit");
+        exec(
+            &mut database,
+            "CREATE TABLE t (id INTEGER, name TEXT); \
+             INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c'), (4, 'd')",
+        );
+        let (columns, rows) = query(
+            &mut database,
+            "SELECT id FROM t ORDER BY id DESC LIMIT 2 OFFSET 1",
+        );
+        assert_eq!(columns, vec!["id".to_string()]);
+        assert_eq!(rows, vec![vec![int(3)], vec![int(2)]]);
+
+        let (_, rows) = query(&mut database, "SELECT id FROM t LIMIT 0");
+        assert!(rows.is_empty());
+        let (_, rows) = query(&mut database, "SELECT id FROM t LIMIT 10 OFFSET 100");
+        assert!(rows.is_empty());
+        let (_, rows) = query(&mut database, "SELECT id FROM t LIMIT 1 OFFSET 0");
+        assert_eq!(rows, vec![vec![int(1)]]);
+        let (_, rows) = query(&mut database, "SELECT id FROM t LIMIT 1 + 1 OFFSET 2");
+        assert_eq!(rows, vec![vec![int(3)], vec![int(4)]]);
+
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM t LIMIT - 1"),
+            (
+                ErrorKind::InvalidInput,
+                "LIMIT must be a non-negative integer".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM t LIMIT 'a'"),
+            (
+                ErrorKind::InvalidInput,
+                "LIMIT must be a non-negative integer".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM t LIMIT TRUE"),
+            (
+                ErrorKind::InvalidInput,
+                "LIMIT must be a non-negative integer".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM t LIMIT 1 OFFSET - 1"),
+            (
+                ErrorKind::InvalidInput,
+                "OFFSET must be a non-negative integer".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM empty LIMIT 1 / 0"),
+            (ErrorKind::NotFound, "table not found: empty".to_string())
+        );
+        exec(&mut database, "CREATE TABLE empty (id INTEGER)");
+        assert_eq!(
+            exec_err(&mut database, "SELECT id FROM empty LIMIT 1 / 0"),
+            (ErrorKind::InvalidInput, "division by zero".to_string())
+        );
+
+        let (_wide, mut wide_db) = open("wide-limit");
+        exec(&mut wide_db, "CREATE TABLE wide (id INTEGER, note TEXT)");
+        let note = "n".repeat(3000);
+        for id in 1..=40 {
+            exec(
+                &mut wide_db,
+                &format!("INSERT INTO wide VALUES ({id}, '{note}')"),
+            );
+        }
+        let before = wide_db.pages_read();
+        let (_, rows) = query(&mut wide_db, "SELECT id FROM wide LIMIT 1");
+        let limited = wide_db.pages_read() - before;
+        assert_eq!(rows, vec![vec![int(1)]]);
+        assert!(limited <= 2, "LIMIT 1 read {limited} pages");
+
+        let before = wide_db.pages_read();
+        let (_, rows) = query(&mut wide_db, "SELECT id FROM wide");
+        let scanned = wide_db.pages_read() - before;
+        assert_eq!(rows.len(), 40);
+        assert!(scanned > 30, "full scan read {scanned}");
+        assert!(limited * 10 < scanned, "limit {limited}, scan {scanned}");
+    }
+
+    #[test]
+    fn joins_names_and_left_join_index_rule() {
+        let (_db, mut database) = open("join");
+        exec(
+            &mut database,
+            "CREATE TABLE a (id INTEGER PRIMARY KEY, x INTEGER, n TEXT); \
+             CREATE TABLE b (id INTEGER PRIMARY KEY, a_id INTEGER, n TEXT); \
+             CREATE TABLE bplain (id INTEGER, a_id INTEGER, n TEXT); \
+             INSERT INTO a VALUES (1, 5, 'a1'), (2, 9, 'a2'), (3, NULL, 'a3'); \
+             INSERT INTO b VALUES (5, 1, 'b5'), (6, 1, 'b6'), (7, 2, 'b7'); \
+             INSERT INTO bplain VALUES (5, 1, 'b5'), (6, 1, 'b6'), (7, 2, 'b7')",
+        );
+
+        let (_, inner) = query(
+            &mut database,
+            "SELECT a.n, b.n FROM a INNER JOIN b ON a.id = b.a_id ORDER BY b.id",
+        );
+        assert_eq!(
+            inner,
+            vec![
+                vec![text("a1"), text("b5")],
+                vec![text("a1"), text("b6")],
+                vec![text("a2"), text("b7")],
+            ]
+        );
+        let (_, comma) = query(
+            &mut database,
+            "SELECT a.n, b.n FROM a, b WHERE a.id = b.a_id ORDER BY b.id",
+        );
+        assert_eq!(comma, inner);
+        let (_, cross) = query(
+            &mut database,
+            "SELECT a.n, b.n FROM a CROSS JOIN b WHERE a.id = b.a_id ORDER BY b.id",
+        );
+        assert_eq!(cross, inner);
+
+        let (_, left) = query(
+            &mut database,
+            "SELECT a.n, b.n FROM a LEFT JOIN b ON a.id = b.a_id ORDER BY a.id, b.id",
+        );
+        assert_eq!(
+            left,
+            vec![
+                vec![text("a1"), text("b5")],
+                vec![text("a1"), text("b6")],
+                vec![text("a2"), text("b7")],
+                vec![text("a3"), Value::Null],
+            ]
+        );
+        let (_, plain_left) = query(
+            &mut database,
+            "SELECT a.n, bplain.n FROM a LEFT JOIN bplain ON a.id = bplain.a_id ORDER BY a.id, bplain.id",
+        );
+        assert_eq!(plain_left, left);
+
+        let (_, filtered) = query(
+            &mut database,
+            "SELECT a.id, b.id FROM a LEFT JOIN b ON a.x = b.id WHERE b.id = 5",
+        );
+        let (_, filtered_plain) = query(
+            &mut database,
+            "SELECT a.id, bplain.id FROM a LEFT JOIN bplain ON a.x = bplain.id WHERE bplain.id = 5",
+        );
+        assert_eq!(filtered, vec![vec![int(1), int(5)]]);
+        assert_eq!(filtered_plain, filtered);
+
+        let (_, unmatched) = query(
+            &mut database,
+            "SELECT a.id FROM a LEFT JOIN b ON a.x = b.id WHERE b.id IS NULL ORDER BY a.id",
+        );
+        assert_eq!(unmatched, vec![vec![int(2)], vec![int(3)]]);
+
+        let described = plan_text(
+            &database,
+            "SELECT a.id, b.id FROM a LEFT JOIN b ON a.x = b.id WHERE b.id = 5",
+        );
+        assert!(
+            !described.contains("IndexLookup"),
+            "left side of a left join must not use the index:\n{described}"
+        );
+
+        exec(
+            &mut database,
+            "CREATE TABLE c (id INTEGER, b_id INTEGER, n TEXT); \
+             INSERT INTO c VALUES (1, 5, 'c1'), (2, 7, 'c2')",
+        );
+        let (columns, rows) = query(
+            &mut database,
+            "SELECT a.n, b.n, c.n \
+             FROM a \
+             INNER JOIN b ON a.id = b.a_id \
+             INNER JOIN c ON b.id = c.b_id \
+             ORDER BY c.id",
+        );
+        assert_eq!(
+            columns,
+            vec!["n".to_string(), "n".to_string(), "n".to_string()]
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("a1"), text("b5"), text("c1")],
+                vec![text("a2"), text("b7"), text("c2")],
+            ]
+        );
+
+        let (_, rows) = query(
+            &mut database,
+            "SELECT e.n, m.n FROM a e LEFT JOIN a m ON e.x = m.id ORDER BY e.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("a1"), Value::Null],
+                vec![text("a2"), Value::Null],
+                vec![text("a3"), Value::Null],
+            ]
+        );
+        exec(
+            &mut database,
+            "CREATE TABLE emp (id INTEGER PRIMARY KEY, name TEXT, mgr INTEGER); \
+             INSERT INTO emp VALUES (1, 'Ann', NULL), (2, 'Bob', 1), (3, 'Cam', 1)",
+        );
+        let (_, rows) = query(
+            &mut database,
+            "SELECT e.name, m.name FROM emp e LEFT JOIN emp m ON e.mgr = m.id ORDER BY e.id",
+        );
+        assert_eq!(
+            rows,
+            vec![
+                vec![text("Ann"), Value::Null],
+                vec![text("Bob"), text("Ann")],
+                vec![text("Cam"), text("Ann")],
+            ]
+        );
+
+        let (columns, rows) = query(
+            &mut database,
+            "SELECT a.*, b.n FROM a INNER JOIN b ON a.id = b.a_id WHERE a.id = 2",
+        );
+        assert_eq!(
+            columns,
+            vec![
+                "id".to_string(),
+                "x".to_string(),
+                "n".to_string(),
+                "n".to_string()
+            ]
+        );
+        assert_eq!(rows, vec![vec![int(2), int(9), text("a2"), text("b7")]]);
+
+        assert_eq!(
+            exec_err(
+                &mut database,
+                "SELECT id FROM a INNER JOIN b ON a.id = b.a_id"
+            ),
+            (ErrorKind::InvalidInput, "ambiguous column: id".to_string())
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT z FROM a"),
+            (ErrorKind::InvalidInput, "column not found: z".to_string())
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT a.id FROM a u"),
+            (
+                ErrorKind::InvalidInput,
+                "column not found: a.id".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT * FROM a, a"),
+            (
+                ErrorKind::InvalidInput,
+                "duplicate table name in FROM: a".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT * FROM a u JOIN b u ON u.id = u.id"),
+            (
+                ErrorKind::InvalidInput,
+                "duplicate table name in FROM: u".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT z.* FROM a"),
+            (
+                ErrorKind::InvalidInput,
+                "table not found in FROM: z".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT * FROM a INNER JOIN b ON a.id = c.id"),
+            (
+                ErrorKind::InvalidInput,
+                "column not found: c.id".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "SELECT * FROM a INNER JOIN b ON 1"),
+            (
+                ErrorKind::InvalidInput,
+                "ON must be a boolean expression".to_string()
+            )
+        );
+
+        let indexed = plan_text(
+            &database,
+            "SELECT a.n, b.n FROM a INNER JOIN b ON a.id = b.a_id WHERE a.id = 1",
+        );
+        assert!(indexed.contains("IndexLookup a key=1"), "{indexed}");
+        assert!(indexed.contains("SeqScan b"), "{indexed}");
+
+        let note = "n".repeat(3000);
+        for id in 10..=40 {
+            exec(
+                &mut database,
+                &format!("INSERT INTO a VALUES ({id}, NULL, '{note}')"),
+            );
+        }
+        let before = database.pages_read();
+        let (_, rows) = query(
+            &mut database,
+            "SELECT a.n, b.n FROM a INNER JOIN b ON a.id = b.a_id WHERE a.id = 1",
+        );
+        let indexed_pages = database.pages_read() - before;
+        assert_eq!(
+            rows,
+            vec![vec![text("a1"), text("b5")], vec![text("a1"), text("b6")]]
+        );
+
+        let before = database.pages_read();
+        let _ = query(
+            &mut database,
+            "SELECT a.n FROM a INNER JOIN b ON a.id = b.a_id WHERE a.id > 0",
+        );
+        let scanned_pages = database.pages_read() - before;
+        assert!(
+            scanned_pages > indexed_pages + 20,
+            "indexed {indexed_pages}, scanned {scanned_pages}"
+        );
+    }
+
+    fn plan_text(db: &Database, sql: &str) -> String {
+        let statement = crate::sql::parse(sql).unwrap().pop().unwrap();
+        let crate::sql::Statement::Select(select) = statement else {
+            panic!("select");
+        };
+        crate::exec::plan::compile_select(db, &select)
+            .unwrap()
+            .plan
+            .describe()
     }
 }
