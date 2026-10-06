@@ -1,10 +1,10 @@
 use std::env;
-use std::io;
+use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use sqltoy::{
-    Column, ColumnType, Database, PageId, PageManager, RecordFile, RecordId, Storage, TableId,
-    Value, PAGE_SIZE,
+    format_result, Column, ColumnType, Database, PageId, PageManager, RecordFile, RecordId,
+    Storage, TableId, Value, PAGE_SIZE,
 };
 
 const USAGE: &str = "\
@@ -30,6 +30,8 @@ commands:
   sqltoy row-update <db_path> <table> <record_id> <value>...
   sqltoy row-delete <db_path> <table> <record_id>
   sqltoy parse <sql>
+  sqltoy sql <db_path> <sql>
+  sqltoy repl <db_path>
 ";
 
 fn main() -> ExitCode {
@@ -135,6 +137,14 @@ fn dispatch(args: &[String]) -> Result<(), CliError> {
         }
         [cmd, sql] if cmd == "parse" => {
             cmd_parse(sql)?;
+            Ok(())
+        }
+        [cmd, path, sql] if cmd == "sql" => {
+            cmd_sql(path, sql)?;
+            Ok(())
+        }
+        [cmd, path] if cmd == "repl" => {
+            cmd_repl(path)?;
             Ok(())
         }
         _ => Err(CliError::Usage),
@@ -328,6 +338,69 @@ fn cmd_parse(sql: &str) -> io::Result<()> {
         println!("{statement};");
     }
     Ok(())
+}
+
+fn cmd_sql(path: &str, sql: &str) -> io::Result<()> {
+    let mut db = Database::open(path)?;
+    for statement in sqltoy::sql::parse(sql)? {
+        let result = db.execute_statement(&statement)?;
+        println!("{}", format_result(&result));
+    }
+    Ok(())
+}
+
+fn cmd_repl(path: &str) -> io::Result<()> {
+    let mut db = Database::open(path)?;
+    let interactive = io::stdin().is_terminal();
+    let stdin = io::stdin();
+    let mut input = stdin.lock();
+    let mut buffer = String::new();
+    loop {
+        if interactive {
+            if buffer.trim().is_empty() {
+                print!("sqltoy> ");
+            } else {
+                print!("   ...> ");
+            }
+            io::stdout().flush()?;
+        }
+        let mut line = String::new();
+        if input.read_line(&mut line)? == 0 {
+            if !buffer.trim().is_empty() {
+                run_buffer(&mut db, &buffer);
+            }
+            break;
+        }
+        // `.quit` applies only when no statement is in progress.
+        if buffer.trim().is_empty() && matches!(line.trim(), ".quit" | ".exit") {
+            break;
+        }
+        buffer.push_str(&line);
+        if buffer.trim_end().ends_with(';') {
+            run_buffer(&mut db, &buffer);
+            buffer.clear();
+        }
+    }
+    Ok(())
+}
+
+fn run_buffer(db: &mut Database, sql: &str) {
+    let statements = match sqltoy::sql::parse(sql) {
+        Ok(statements) => statements,
+        Err(err) => {
+            eprintln!("error: {err}");
+            return;
+        }
+    };
+    for statement in &statements {
+        match db.execute_statement(statement) {
+            Ok(result) => println!("{}", format_result(&result)),
+            Err(err) => {
+                eprintln!("error: {err}");
+                return;
+            }
+        }
+    }
 }
 
 fn parse_row_values(db: &Database, table: &str, raw_values: &[String]) -> io::Result<Vec<Value>> {

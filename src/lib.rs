@@ -7,10 +7,11 @@
 //! the file and restores them when the database is opened. The table layer
 //! stores typed rows in those tables, including NULL. The SQL parser turns
 //! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` text into an
-//! AST. The executor is not implemented yet. Later layers are specified in
-//! `docs/adr/`.
+//! AST. The executor evaluates expressions, including `WHERE`, and runs those
+//! statements. Later layers are specified in `docs/adr/`.
 
 pub mod catalog;
+pub mod exec;
 pub mod page;
 pub mod record;
 pub mod row;
@@ -20,6 +21,7 @@ pub mod storage;
 pub mod table;
 
 pub use catalog::{Column, ColumnType, Database, TableSchema};
+pub use exec::{format_result, QueryResult};
 pub use page::{Page, PageId, PageManager, PAGE_SIZE};
 pub use record::{RecordFile, RecordId, TableId, MAX_RECORD_SIZE};
 pub use row::Value;
