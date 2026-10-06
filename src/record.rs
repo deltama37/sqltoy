@@ -4,6 +4,13 @@
 //! page layer. Later pages are record pages allocated and initialized here.
 //! Record ids stay stable across deletes and compaction, and are unique in
 //! the file.
+//!
+//! Mutations update a [`crate::buffer::BufferPool`] and do not sync a single
+//! page on their own. [`RecordFile::open`] flushes after each insert, update,
+//! and delete so the record CLI stays durable across processes.
+//! [`crate::catalog::Database`] opens with [`RecordFile::open_pooled`], which
+//! leaves that flush off, and syncs once at the end of a statement or a
+//! public row call.
 
 use std::fmt;
 use std::io::{self, ErrorKind};
@@ -11,7 +18,8 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::btree::PAGE_TYPE_BTREE;
-use crate::page::{PageId, PageManager};
+use crate::buffer::{BufferPool, BufferStats, DEFAULT_POOL_PAGES};
+use crate::page::PageId;
 use crate::slotted_page::SlottedPage;
 
 pub use crate::slotted_page::MAX_RECORD_SIZE;
@@ -75,14 +83,32 @@ impl FromStr for RecordId {
 /// Each record page belongs to a single table. Record ids are unique in the
 /// file and stay stable across deletes and compaction.
 pub struct RecordFile {
-    pages: PageManager,
+    pages: BufferPool,
+    /// When set, each successful insert, update, or delete flushes the pool.
+    autoflush: bool,
 }
 
 impl RecordFile {
     /// Opens the database at `path`, creating it when the file is empty.
+    ///
+    /// Uses [`DEFAULT_POOL_PAGES`] frames. Each insert, update, and delete
+    /// flushes before it returns.
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<RecordFile> {
+        Self::open_in(path, DEFAULT_POOL_PAGES, true)
+    }
+
+    /// Opens `path` with `frames` and does not flush after each mutation.
+    ///
+    /// [`crate::catalog::Database`] flushes at statement and public-API
+    /// boundaries instead, so one statement does not sync once per page.
+    pub(crate) fn open_pooled<P: AsRef<Path>>(path: P, frames: usize) -> io::Result<RecordFile> {
+        Self::open_in(path, frames, false)
+    }
+
+    fn open_in<P: AsRef<Path>>(path: P, frames: usize, autoflush: bool) -> io::Result<RecordFile> {
         Ok(RecordFile {
-            pages: PageManager::open(path)?,
+            pages: BufferPool::open(path, frames)?,
+            autoflush,
         })
     }
 
@@ -107,7 +133,7 @@ impl RecordFile {
                 continue;
             }
             if let Some(slot_id) = slotted.insert(record) {
-                self.store(page_id, &slotted)?;
+                self.store_and_flush(page_id, &slotted)?;
                 return Ok(RecordId { page_id, slot_id });
             }
         }
@@ -119,7 +145,7 @@ impl RecordFile {
                 "initialized record page has no room",
             ));
         };
-        self.store(page_id, &slotted)?;
+        self.store_and_flush(page_id, &slotted)?;
         Ok(RecordId { page_id, slot_id })
     }
 
@@ -156,7 +182,7 @@ impl RecordFile {
         }
         match page.update(id.slot_id, record) {
             Ok(true) => {
-                self.store(id.page_id, &page)?;
+                self.store_and_flush(id.page_id, &page)?;
                 Ok(true)
             }
             Ok(false) => Ok(false),
@@ -200,7 +226,7 @@ impl RecordFile {
                 err
             }
         })?;
-        self.store(id.page_id, &page)
+        self.store_and_flush(id.page_id, &page)
     }
 
     /// Live records owned by `table`, in page order, then slot order.
@@ -286,19 +312,34 @@ impl RecordFile {
         Ok(Some(SlottedPage::from_page(page_id, page)?))
     }
 
-    /// Pages read since this file was opened.
+    /// Logical page reads since this file was opened.
+    ///
+    /// A hit and a miss both count. The counter is not stored in the file.
     pub fn pages_read(&self) -> u64 {
-        self.pages.pages_read()
+        self.pages.stats().logical_reads
     }
 
-    /// Page manager, so the index can share this file.
-    pub(crate) fn pages_mut(&mut self) -> &mut PageManager {
+    /// Buffer-pool counters since this file was opened.
+    pub(crate) fn buffer_stats(&self) -> BufferStats {
+        self.pages.stats()
+    }
+
+    /// Writes dirty pages and syncs the file.
+    pub fn flush(&mut self) -> io::Result<()> {
+        self.pages.flush()
+    }
+
+    /// Buffer pool, so the index can share this file.
+    pub(crate) fn pages_mut(&mut self) -> &mut BufferPool {
         &mut self.pages
     }
 
-    fn store(&mut self, page_id: PageId, slotted: &SlottedPage) -> io::Result<()> {
+    fn store_and_flush(&mut self, page_id: PageId, slotted: &SlottedPage) -> io::Result<()> {
         self.pages.write_page(page_id, slotted.page())?;
-        self.pages.sync()
+        if self.autoflush {
+            self.pages.flush()?;
+        }
+        Ok(())
     }
 }
 

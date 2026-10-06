@@ -15,6 +15,8 @@ are in `docs/adr/`:
 - ADR-0009 fixes the primary key and the B+Tree index page format.
 - ADR-0010 fixes operator-based query execution, including `ORDER BY`,
   `LIMIT` / `OFFSET`, and `JOIN`.
+- ADR-0011 fixes the buffer pool: a fixed number of frames, LRU eviction,
+  and a flush at the end of each statement.
 
 ## Status
 
@@ -41,7 +43,17 @@ done. A `SELECT` is a tree of operators: a sequential scan reads one page
 at a time, an index lookup replaces that scan when a primary key is a
 constant equality, and `JOIN`, `ORDER BY`, and `LIMIT` / `OFFSET` are a
 nested-loop join, a stable sort, and a limit. `LIMIT` stops the scan once
-it has enough rows. A comma in `FROM` is a cross join.
+it has enough rows. A comma in `FROM` is a cross join. The buffer pool
+(ADR-0002 step 10, per ADR-0011) is done. Record storage, the B+Tree, and
+the catalog read and write pages through a fixed set of frames (256 by
+default, at least 1). A read copies a frame out. A write copies into a
+frame and marks it dirty, and does not read the file when the page is not
+cached. The least recently used frame is evicted when the pool is full; a
+dirty victim is written first and not synced. Flush writes every dirty page
+in page-id order and then syncs. A SQL statement flushes once when it
+finishes, including when it fails. `Database::insert`, `update`, `delete`,
+`insert_all`, `apply_update`, and `create_table` flush once at the end as
+well.
 
 ## Build and test
 
@@ -81,11 +93,12 @@ INSERT 1
 error: duplicate primary key: 1
 ```
 
-`Database::pages_read` counts pages read since the database was opened. A
-primary-key equality reads a handful of pages (the tree height, plus the
-row). A query without that equality reads every page. `SELECT * FROM t
-LIMIT 1` on a table that spans dozens of pages reads one or two pages and
-then stops. The counter is not exposed by the CLI.
+`Database::pages_read` counts logical page reads since the database was
+opened, hits and misses together, so the count does not depend on which
+pages are cached. A primary-key equality reads a handful of pages (the tree
+height, plus the row). A query without that equality reads every page.
+`SELECT * FROM t LIMIT 1` on a table that spans dozens of pages reads one
+or two pages and then stops. `repl` prints the pool counters with `.stats`.
 
 A left join keeps unmatched left rows and fills the right side with `NULL`.
 `ORDER BY` is stable, and `NULL` sorts first in `ASC` and last in `DESC`.
@@ -150,6 +163,39 @@ INSERT 2
 ----+-------
   1 | Alice 
 (1 row)
+```
+
+## Buffer pool
+
+`repl` prints buffer-pool counters with `.stats` when no statement is in
+progress. The numbers are cumulative since the database was opened. In this
+session the new pages were allocated in the pool, so every read was a hit
+and the file was not read back. `CREATE TABLE` and `INSERT` wrote 4 pages
+and synced at the end of each statement:
+
+```bash
+cargo run --quiet -- repl /tmp/sqltoy-buffer.db <<'EOF'
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Alice'), (2, 'Bob');
+SELECT * FROM users WHERE id = 1;
+SELECT * FROM users WHERE id = 1;
+.stats
+.quit
+EOF
+```
+
+```text
+CREATE TABLE
+INSERT 2
+ id | name  
+----+-------
+  1 | Alice 
+(1 row)
+ id | name  
+----+-------
+  1 | Alice 
+(1 row)
+logical reads: 14, hits: 14, misses: 0, pages written: 4, evictions: 0
 ```
 
 ## Storage CLI
