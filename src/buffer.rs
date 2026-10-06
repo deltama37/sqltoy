@@ -125,6 +125,10 @@ pub struct BufferPool {
     tick: u64,
     stats: BufferStats,
     savepoint: Option<Savepoint>,
+    /// Set after the WAL commit record is synced and cleared after the log is
+    /// truncated. A checkpoint error in between leaves the commit durable in
+    /// the log. Rollback must not undo those pages.
+    wal_commit_pending: bool,
     #[cfg(test)]
     disk_writes: Vec<u32>,
 }
@@ -165,6 +169,7 @@ impl BufferPool {
             tick: 0,
             stats: BufferStats::default(),
             savepoint: None,
+            wal_commit_pending: false,
             #[cfg(test)]
             disk_writes: Vec::new(),
         })
@@ -271,6 +276,7 @@ impl BufferPool {
         }
         let borrowed: Vec<(PageId, &Page)> = stored.iter().map(|(id, page)| (*id, page)).collect();
         self.wal.append_commit(&borrowed, self.logical_pages)?;
+        self.wal_commit_pending = true;
         for id in &ids {
             let index = self
                 .find(*id)
@@ -289,8 +295,17 @@ impl BufferPool {
         self.pages.sync()?;
         crash_point("before-wal-truncate");
         self.wal.truncate()?;
+        self.wal_commit_pending = false;
         self.shrink();
         Ok(())
+    }
+
+    /// Whether a commit record was synced and the log has not been truncated.
+    ///
+    /// The database file may be only partly checkpointed. The frames already
+    /// hold the committed images. The next open replays the log.
+    pub(crate) fn wal_commit_pending(&self) -> bool {
+        self.wal_commit_pending
     }
 
     /// Drops every dirty frame and forgets pages that were only allocated in

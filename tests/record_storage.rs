@@ -35,7 +35,7 @@ fn records_persist_after_reopen() {
     drop(records);
 
     let mut pages = PageManager::open(&path).expect("pages");
-    assert_eq!(pages.format_version().expect("version"), 3);
+    assert_eq!(pages.format_version().expect("version"), 4);
 }
 
 #[test]

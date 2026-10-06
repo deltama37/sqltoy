@@ -11,7 +11,7 @@ use crate::btree::BTree;
 use crate::catalog::{Database, TableSchema};
 use crate::page::PageId;
 use crate::record::RecordId;
-use crate::row::{decode_row, Value};
+use crate::row::Value;
 use crate::sql::{Expr, JoinKind};
 
 use super::eval::{eval, invalid, Binding, RowContext};
@@ -155,7 +155,9 @@ impl Operator for SeqScan {
                     self.buffer_index = 0;
                     let mut decoded = Vec::with_capacity(records.len());
                     for (id, bytes) in records {
-                        decoded.push((id, decode_row(&self.schema, id, &bytes)?));
+                        if let Some(values) = db.visible_values(&self.schema, id, &bytes)? {
+                            decoded.push((id, values));
+                        }
                     }
                     self.buffer = decoded;
                 }
@@ -167,7 +169,9 @@ impl Operator for SeqScan {
 struct IndexLookup {
     schema: TableSchema,
     key: i64,
-    done: bool,
+    pending: Vec<(RecordId, Vec<Value>)>,
+    pending_index: usize,
+    loaded: bool,
 }
 
 impl IndexLookup {
@@ -175,26 +179,35 @@ impl IndexLookup {
         IndexLookup {
             schema,
             key,
-            done: false,
+            pending: Vec::new(),
+            pending_index: 0,
+            loaded: false,
         }
     }
 }
 
 impl Operator for IndexLookup {
     fn next(&mut self, db: &mut Database) -> io::Result<Option<Tuple>> {
-        if self.done {
+        if !self.loaded {
+            self.loaded = true;
+            let root = self
+                .schema
+                .index_root
+                .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing index root"))?;
+            let tree = BTree::open(root, self.schema.id);
+            let ids = tree.lookup(db.records.pages_mut(), self.key)?;
+            for id in ids {
+                let bytes = db.records.get(self.schema.id, id)?;
+                if let Some(values) = db.visible_values(&self.schema, id, &bytes)? {
+                    self.pending.push((id, values));
+                }
+            }
+        }
+        if self.pending_index >= self.pending.len() {
             return Ok(None);
         }
-        self.done = true;
-        let root = self
-            .schema
-            .index_root
-            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing index root"))?;
-        let tree = BTree::open(root, self.schema.id);
-        let Some(id) = tree.get(db.records.pages_mut(), self.key)? else {
-            return Ok(None);
-        };
-        let values = db.get(&self.schema.name, id)?;
+        let (id, values) = self.pending[self.pending_index].clone();
+        self.pending_index += 1;
         Ok(Some(one_binding(values, Some(id))))
     }
 }

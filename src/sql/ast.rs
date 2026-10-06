@@ -28,6 +28,8 @@ pub enum Statement {
     Commit,
     /// `ROLLBACK`.
     Rollback,
+    /// `VACUUM`.
+    Vacuum,
 }
 
 /// `CREATE TABLE name (column type, ...)`.
@@ -280,6 +282,7 @@ impl fmt::Display for Statement {
             Statement::Begin => f.write_str("BEGIN"),
             Statement::Commit => f.write_str("COMMIT"),
             Statement::Rollback => f.write_str("ROLLBACK"),
+            Statement::Vacuum => f.write_str("VACUUM"),
         }
     }
 }

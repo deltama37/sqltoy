@@ -3,6 +3,7 @@
 //! The catalog is the record set of [`TableId::CATALOG`]. Each user table is
 //! one record. Opening a database reads those records back into memory.
 
+use std::collections::BTreeSet;
 use std::fmt;
 use std::io::{self, ErrorKind};
 use std::path::Path;
@@ -10,7 +11,8 @@ use std::str::FromStr;
 
 use crate::btree::BTree;
 use crate::buffer::{BufferStats, DEFAULT_POOL_PAGES};
-use crate::page::PageId;
+use crate::mvcc::Snapshot;
+use crate::page::{Page, PageId, CLEANUP_FLAG_OFFSET, NEXT_XID_OFFSET};
 use crate::record::{RecordFile, RecordId, TableId, MAX_RECORD_SIZE};
 
 /// SQL column type stored in the catalog.
@@ -114,19 +116,72 @@ pub struct TableSchema {
     pub index_root: Option<PageId>,
 }
 
+/// Identity of one session.
+///
+/// A [`Database`] starts with one session, returned by
+/// [`Database::default_session`]. [`Database::execute`] and the row methods
+/// use that session. [`Database::execute_in`] runs on another session.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub struct SessionId(pub u32);
+
 /// An open database file and the schemas loaded from its catalog.
 ///
-/// Pages sit in a [`crate::buffer::BufferPool`]. Outside an explicit
-/// transaction, [`Self::execute_statement`] and the public table methods
-/// flush once when they succeed. A statement that fails is rolled back to
-/// the savepoint taken at its start, and the catalog is reloaded from pages.
-/// Inside [`Self::begin`], those methods leave dirty pages in memory until
-/// [`Self::commit`] or [`Self::rollback`]. Dropping a [`Database`] does not
-/// flush, so an open transaction is lost.
+/// Pages sit in a [`crate::buffer::BufferPool`]. Each session has at most one
+/// transaction. Outside an explicit transaction, [`Self::execute_statement`]
+/// and the public table methods run as a one-statement transaction and commit
+/// it when they succeed. A statement that fails is rolled back to the
+/// savepoint taken at its start, and the catalog is reloaded from pages.
+/// Inside [`Self::begin`], those methods leave the session's versions
+/// uncommitted until [`Self::commit`] or [`Self::rollback`]. Commit sets the
+/// version flags and flushes. Rollback undoes that session's write set and
+/// flushes; it does not drop another session's dirty pages. Dropping a
+/// [`Database`] does not flush, so an open transaction is lost unless some
+/// other session's commit already wrote its pages.
 pub struct Database {
     pub(crate) records: RecordFile,
     tables: Vec<TableSchema>,
-    in_transaction: bool,
+    /// Cached header page. Transaction ids are written here, through the pool.
+    header: Page,
+    next_xid: u64,
+    sessions: Vec<Session>,
+    default_session: SessionId,
+    /// Session whose statement or row call is running.
+    exec_session: SessionId,
+    next_session_id: u32,
+}
+
+struct Session {
+    id: SessionId,
+    txn: Option<Transaction>,
+}
+
+pub(crate) struct Transaction {
+    pub xid: u64,
+    pub snapshot: Snapshot,
+    pub write_set: Vec<WriteEntry>,
+    pub explicit: bool,
+    pub created_tables: Vec<CreatedTable>,
+    /// Pages were changed outside the write set (`VACUUM`).
+    pub physical_writes: bool,
+}
+
+pub(crate) struct CreatedTable {
+    pub id: TableId,
+    pub catalog_rid: RecordId,
+}
+
+#[derive(Clone, Copy)]
+pub(crate) enum WriteKind {
+    Inserted,
+    Deleted,
+}
+
+#[derive(Clone)]
+pub(crate) struct WriteEntry {
+    pub table: TableId,
+    pub rid: RecordId,
+    pub key: Option<i64>,
+    pub kind: WriteKind,
 }
 
 impl Database {
@@ -146,12 +201,86 @@ impl Database {
     /// `frames` must be at least 1. The catalog rules match [`Self::open`].
     pub fn open_with_frames<P: AsRef<Path>>(path: P, frames: usize) -> io::Result<Database> {
         let mut records = RecordFile::open_pooled(path, frames)?;
+        let header = records.pages_mut().read_page(PageId(0))?;
+        let next_xid = read_u64(&header.data()[NEXT_XID_OFFSET..NEXT_XID_OFFSET + 8]);
+        if next_xid == 0 {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                "invalid next transaction id: 0",
+            ));
+        }
+        let cleanup = header.data()[CLEANUP_FLAG_OFFSET];
         let tables = load_tables(&mut records)?;
-        Ok(Database {
+        let default_session = SessionId(1);
+        let mut database = Database {
             records,
             tables,
-            in_transaction: false,
-        })
+            header,
+            next_xid,
+            sessions: vec![Session {
+                id: default_session,
+                txn: None,
+            }],
+            default_session,
+            exec_session: default_session,
+            next_session_id: 2,
+        };
+        if cleanup == 1 {
+            database.crash_cleanup()?;
+        }
+        Ok(database)
+    }
+
+    /// The session used by [`Self::execute`], [`Self::begin`], and the row methods.
+    pub fn default_session(&self) -> SessionId {
+        self.default_session
+    }
+
+    /// Starts a session with no transaction and returns its id.
+    pub fn create_session(&mut self) -> SessionId {
+        let id = SessionId(self.next_session_id);
+        self.next_session_id = self.next_session_id.saturating_add(1);
+        self.sessions.push(Session { id, txn: None });
+        id
+    }
+
+    /// Rolls back an open transaction on `id`, then forgets the session.
+    ///
+    /// An unknown id is [`ErrorKind::NotFound`] (`unknown session: {id}`).
+    pub fn close_session(&mut self, id: SessionId) -> io::Result<()> {
+        let explicit = self.session_in_transaction(id)?;
+        let has_txn = self.session(id)?.txn.is_some();
+        if explicit {
+            self.rollback_on(id)?;
+        } else if has_txn {
+            self.finish_rollback(id)?;
+        }
+        let index = self.session_index(id)?;
+        self.sessions.remove(index);
+        if self.exec_session == id {
+            self.exec_session = self.default_session;
+        }
+        Ok(())
+    }
+
+    /// Whether `id` is inside [`Self::begin`].
+    ///
+    /// An implicit one-statement transaction does not count. An unknown id is
+    /// [`ErrorKind::NotFound`].
+    pub fn session_in_transaction(&self, id: SessionId) -> io::Result<bool> {
+        Ok(self
+            .session(id)?
+            .txn
+            .as_ref()
+            .is_some_and(|txn| txn.explicit))
+    }
+
+    /// Next transaction id that will be assigned.
+    ///
+    /// Stored in the header on every flush. Every version written since the
+    /// previous flush has a smaller id.
+    pub fn next_transaction_id(&self) -> u64 {
+        self.next_xid
     }
 
     /// Creates a user table and, outside a transaction, flushes its catalog record.
@@ -170,9 +299,9 @@ impl Database {
     /// is written. Tables without a primary key have no index.
     ///
     /// Outside a transaction the buffer pool is flushed before this returns.
-    /// A failed call rolls the statement back. If the autocommit flush fails,
-    /// dirty frames are discarded and this returns the flush error; pages
-    /// that flush already wrote can remain on disk.
+    /// A failed call rolls the statement back to its savepoint. If the
+    /// autocommit flush fails before the WAL sync, that savepoint is restored.
+    /// Pages that a synced commit already wrote can remain on disk.
     pub fn create_table(
         &mut self,
         name: &str,
@@ -236,6 +365,12 @@ impl Database {
                 format!("table already exists: {name}"),
             ));
         }
+        if self.other_transactions_active() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "CREATE TABLE requires no other active transactions",
+            ));
+        }
         let id = next_table_id(&self.tables)?;
         let index_root = if primary_key.is_some() {
             Some(BTree::create(self.records.pages_mut(), id)?)
@@ -250,8 +385,9 @@ impl Database {
             index_root,
         };
         let bytes = encode_schema(&schema)?;
-        self.records.insert(TableId::CATALOG, &bytes)?;
+        let catalog_rid = self.records.insert(TableId::CATALOG, &bytes)?;
         self.tables.push(schema);
+        self.record_created_table(CreatedTable { id, catalog_rid })?;
         Ok(())
     }
 
@@ -269,22 +405,15 @@ impl Database {
         self.records.buffer_stats()
     }
 
-    /// Starts an explicit transaction.
+    /// Starts an explicit transaction on the default session.
     ///
-    /// A second call while one is open is [`ErrorKind::InvalidInput`]
-    /// (`transaction already in progress`).
+    /// The snapshot is taken here. A second call while one is open is
+    /// [`ErrorKind::InvalidInput`] (`transaction already in progress`).
     pub fn begin(&mut self) -> io::Result<()> {
-        if self.in_transaction {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "transaction already in progress",
-            ));
-        }
-        self.in_transaction = true;
-        Ok(())
+        self.begin_on(self.default_session)
     }
 
-    /// Flushes dirty pages and ends the explicit transaction.
+    /// Sets commit flags on the default session's versions and flushes.
     ///
     /// No open transaction is [`ErrorKind::InvalidInput`]
     /// (`no transaction in progress`). The flush commits through the WAL. If
@@ -294,37 +423,26 @@ impl Database {
     /// [`Self::rollback`]. Rollback does not erase a commit already synced to
     /// the WAL; the next open replays it.
     pub fn commit(&mut self) -> io::Result<()> {
-        if !self.in_transaction {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "no transaction in progress",
-            ));
-        }
-        self.records.flush()?;
-        self.in_transaction = false;
-        Ok(())
+        self.commit_on(self.default_session)
     }
 
-    /// Drops every dirty page, reloads the catalog, and ends the transaction.
+    /// Undoes the default session's write set, flushes, and ends the transaction.
+    ///
+    /// Created versions are deleted, including their index entries. Deleted
+    /// versions get `xmax` reset to 0. Tables created in the transaction lose
+    /// their catalog record after the rows are undone; their pages stay.
+    /// Another session's changes on the same pages are left in place.
     ///
     /// No open transaction is [`ErrorKind::InvalidInput`]
     /// (`no transaction in progress`).
     pub fn rollback(&mut self) -> io::Result<()> {
-        if !self.in_transaction {
-            return Err(io::Error::new(
-                ErrorKind::InvalidInput,
-                "no transaction in progress",
-            ));
-        }
-        self.records.discard_dirty()?;
-        self.reload_catalog()?;
-        self.in_transaction = false;
-        Ok(())
+        self.rollback_on(self.default_session)
     }
 
-    /// Whether [`Self::begin`] is in effect.
+    /// Whether [`Self::begin`] is in effect on the default session.
     pub fn in_transaction(&self) -> bool {
-        self.in_transaction
+        self.session_in_transaction(self.default_session)
+            .unwrap_or(false)
     }
 
     /// Frames held by the buffer pool, including overflow past its capacity.
@@ -333,39 +451,65 @@ impl Database {
         self.records.frame_count()
     }
 
-    /// Runs `body` as one atomic statement.
+    /// Runs `body` as one atomic statement on the executing session.
     ///
-    /// On success the savepoint is released. Outside an explicit transaction
-    /// the pool is then flushed. On failure the savepoint is restored, the
-    /// catalog is reloaded, and `body`'s error is returned. Outside an
-    /// explicit transaction, dirty frames are also discarded.
+    /// A session with no transaction starts an implicit one for this call and
+    /// commits it on success. On failure the savepoint is restored, the write
+    /// set and created-table list are truncated to their lengths at the start,
+    /// and the catalog is reloaded. An explicit transaction stays open.
     ///
-    /// If the autocommit flush fails before the WAL sync, dirty frames are
-    /// discarded and the catalog is reloaded. If it fails after that sync,
-    /// the frames are already clean, so discarding dirty frames leaves the
-    /// committed images in place. The next open replays the WAL when the
-    /// checkpoint did not finish.
+    /// If the autocommit flush fails before the WAL sync, the savepoint is
+    /// restored and the implicit transaction ends. If it fails after that
+    /// sync, the commit is already in the log. The next open replays it.
+    /// Dirty frames are not discarded: another session may share them.
     pub(crate) fn in_statement<T>(
         &mut self,
         body: impl FnOnce(&mut Self) -> io::Result<T>,
     ) -> io::Result<T> {
+        let session = self.exec_session;
+        let started_here = self.session(session)?.txn.is_none();
+        if started_here {
+            self.begin_transaction(session, false)?;
+        }
+        let (write_len, created_len) = {
+            let txn = self.session(session)?.txn.as_ref().expect("transaction");
+            (txn.write_set.len(), txn.created_tables.len())
+        };
         self.records.set_savepoint()?;
         let result = body(self);
-        self.finish_statement(result)
+        self.finish_statement(session, started_here, write_len, created_len, result)
     }
 
-    fn finish_statement<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+    fn finish_statement<T>(
+        &mut self,
+        session: SessionId,
+        started_here: bool,
+        write_len: usize,
+        created_len: usize,
+        result: io::Result<T>,
+    ) -> io::Result<T> {
         match result {
             Ok(value) => {
-                self.records.release_savepoint()?;
-                if self.in_transaction {
+                if !started_here {
+                    self.records.release_savepoint()?;
                     return Ok(value);
                 }
-                match self.records.flush() {
-                    Ok(()) => Ok(value),
+                match self.prepare_and_flush(session) {
+                    Ok(()) => {
+                        self.clear_txn(session)?;
+                        self.records.release_savepoint()?;
+                        Ok(value)
+                    }
                     Err(flush_err) => {
-                        let _ = self.records.discard_dirty();
-                        let _ = self.reload_catalog();
+                        if self.records.wal_commit_pending() {
+                            let _ = self.clear_txn(session);
+                            let _ = self.records.release_savepoint();
+                        } else {
+                            let _ = self.records.rollback_to_savepoint();
+                            let _ = self.records.release_savepoint();
+                            let _ = self.clear_txn(session);
+                            let _ = self.reload_catalog();
+                        }
                         Err(flush_err)
                     }
                 }
@@ -373,8 +517,10 @@ impl Database {
             Err(original) => {
                 let _ = self.records.rollback_to_savepoint();
                 let _ = self.records.release_savepoint();
-                if !self.in_transaction {
-                    let _ = self.records.discard_dirty();
+                if started_here {
+                    let _ = self.clear_txn(session);
+                } else {
+                    let _ = self.truncate_txn(session, write_len, created_len);
                 }
                 let _ = self.reload_catalog();
                 Err(original)
@@ -385,6 +531,294 @@ impl Database {
     fn reload_catalog(&mut self) -> io::Result<()> {
         self.tables = load_tables(&mut self.records)?;
         Ok(())
+    }
+
+    pub(crate) fn begin_on(&mut self, id: SessionId) -> io::Result<()> {
+        if self.session(id)?.txn.is_some() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "transaction already in progress",
+            ));
+        }
+        self.begin_transaction(id, true)
+    }
+
+    pub(crate) fn commit_on(&mut self, id: SessionId) -> io::Result<()> {
+        self.ensure_explicit(id)?;
+        self.prepare_and_flush(id)?;
+        self.clear_txn(id)?;
+        Ok(())
+    }
+
+    pub(crate) fn rollback_on(&mut self, id: SessionId) -> io::Result<()> {
+        self.ensure_explicit(id)?;
+        self.finish_rollback(id)
+    }
+
+    fn finish_rollback(&mut self, id: SessionId) -> io::Result<()> {
+        if self.records.wal_commit_pending() {
+            self.clear_txn(id)?;
+            return Ok(());
+        }
+        self.undo_transaction(id)?;
+        self.clear_txn(id)?;
+        self.persist_header(self.cleanup_flag())?;
+        self.records.flush()?;
+        Ok(())
+    }
+
+    fn begin_transaction(&mut self, id: SessionId, explicit: bool) -> io::Result<()> {
+        let xid = self.next_xid;
+        self.next_xid = self.next_xid.checked_add(1).ok_or_else(|| {
+            io::Error::new(ErrorKind::InvalidData, "transaction id space exhausted")
+        })?;
+        let bound = self.next_xid;
+        let active = self.active_xids();
+        let index = self.session_index(id)?;
+        self.sessions[index].txn = Some(Transaction {
+            xid,
+            snapshot: Snapshot { xid, bound, active },
+            write_set: Vec::new(),
+            explicit,
+            created_tables: Vec::new(),
+            physical_writes: false,
+        });
+        Ok(())
+    }
+
+    pub(crate) fn mark_physical_writes(&mut self) -> io::Result<()> {
+        let index = self.session_index(self.exec_session)?;
+        if let Some(txn) = self.sessions[index].txn.as_mut() {
+            txn.physical_writes = true;
+        }
+        Ok(())
+    }
+
+    /// Commit flags, then the header, then the WAL flush.
+    ///
+    /// The header cleanup flag is 1 when some other session still has a
+    /// non-empty write set. A flush that already synced its log returns
+    /// without writing again.
+    fn prepare_and_flush(&mut self, id: SessionId) -> io::Result<()> {
+        if self.records.wal_commit_pending() {
+            return Ok(());
+        }
+        // A read-only transaction's xid never reaches disk, so there is
+        // nothing to commit and the header need not advance.
+        let index = self.session_index(id)?;
+        let read_only = self.sessions[index].txn.as_ref().is_some_and(|txn| {
+            txn.write_set.is_empty() && txn.created_tables.is_empty() && !txn.physical_writes
+        });
+        if read_only {
+            return Ok(());
+        }
+        self.apply_commit_flags(id)?;
+        self.persist_header(self.cleanup_flag_except(id))?;
+        self.records.flush()
+    }
+
+    fn apply_commit_flags(&mut self, id: SessionId) -> io::Result<()> {
+        let index = self.session_index(id)?;
+        let writes = self.sessions[index]
+            .txn
+            .as_ref()
+            .ok_or_else(no_transaction)?
+            .write_set
+            .clone();
+        for entry in writes {
+            let mut bytes = self.records.get(entry.table, entry.rid)?;
+            match entry.kind {
+                WriteKind::Inserted => crate::mvcc::set_xmin_committed(&mut bytes)?,
+                WriteKind::Deleted => crate::mvcc::set_xmax_committed(&mut bytes)?,
+            }
+            self.records.update(entry.table, entry.rid, &bytes)?;
+        }
+        Ok(())
+    }
+
+    fn undo_transaction(&mut self, id: SessionId) -> io::Result<()> {
+        let index = self.session_index(id)?;
+        let (writes, created) = {
+            let txn = self.sessions[index]
+                .txn
+                .as_mut()
+                .ok_or_else(no_transaction)?;
+            (
+                std::mem::take(&mut txn.write_set),
+                std::mem::take(&mut txn.created_tables),
+            )
+        };
+        for entry in writes.into_iter().rev() {
+            match entry.kind {
+                WriteKind::Inserted => self.undo_inserted(&entry)?,
+                WriteKind::Deleted => self.undo_deleted(&entry)?,
+            }
+        }
+        for created in created.into_iter().rev() {
+            self.records.delete(TableId::CATALOG, created.catalog_rid)?;
+            self.tables.retain(|table| table.id != created.id);
+        }
+        Ok(())
+    }
+
+    fn crash_cleanup(&mut self) -> io::Result<()> {
+        self.purge_aborted_versions()?;
+        self.persist_header(0)?;
+        self.records.flush()
+    }
+
+    fn persist_header(&mut self, cleanup: u8) -> io::Result<()> {
+        self.header.data_mut()[NEXT_XID_OFFSET..NEXT_XID_OFFSET + 8]
+            .copy_from_slice(&self.next_xid.to_le_bytes());
+        self.header.data_mut()[CLEANUP_FLAG_OFFSET] = cleanup;
+        let mut page = Page::zeroed();
+        page.data_mut().copy_from_slice(self.header.data());
+        self.records.pages_mut().write_page(PageId(0), &page)
+    }
+
+    fn cleanup_flag(&self) -> u8 {
+        u8::from(self.sessions.iter().any(|session| {
+            session
+                .txn
+                .as_ref()
+                .is_some_and(|txn| !txn.write_set.is_empty())
+        }))
+    }
+
+    fn cleanup_flag_except(&self, id: SessionId) -> u8 {
+        u8::from(self.sessions.iter().any(|session| {
+            session.id != id
+                && session
+                    .txn
+                    .as_ref()
+                    .is_some_and(|txn| !txn.write_set.is_empty())
+        }))
+    }
+
+    fn clear_txn(&mut self, id: SessionId) -> io::Result<()> {
+        let index = self.session_index(id)?;
+        self.sessions[index].txn = None;
+        Ok(())
+    }
+
+    fn truncate_txn(
+        &mut self,
+        id: SessionId,
+        write_len: usize,
+        created_len: usize,
+    ) -> io::Result<()> {
+        let index = self.session_index(id)?;
+        if let Some(txn) = self.sessions[index].txn.as_mut() {
+            txn.write_set.truncate(write_len);
+            txn.created_tables.truncate(created_len);
+        }
+        Ok(())
+    }
+
+    fn ensure_explicit(&self, id: SessionId) -> io::Result<()> {
+        match self.session(id)?.txn.as_ref() {
+            Some(txn) if txn.explicit => Ok(()),
+            _ => Err(no_transaction()),
+        }
+    }
+
+    fn session(&self, id: SessionId) -> io::Result<&Session> {
+        let index = self.session_index(id)?;
+        Ok(&self.sessions[index])
+    }
+
+    fn session_index(&self, id: SessionId) -> io::Result<usize> {
+        self.sessions
+            .iter()
+            .position(|session| session.id == id)
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::NotFound, format!("unknown session: {}", id.0))
+            })
+    }
+
+    fn active_xids(&self) -> BTreeSet<u64> {
+        self.sessions
+            .iter()
+            .filter_map(|session| session.txn.as_ref().map(|txn| txn.xid))
+            .collect()
+    }
+
+    pub(crate) fn active_xid_set(&self) -> BTreeSet<u64> {
+        self.active_xids()
+    }
+
+    pub(crate) fn active_snapshots(&self) -> Vec<Snapshot> {
+        self.sessions
+            .iter()
+            .filter_map(|session| session.txn.as_ref().map(|txn| txn.snapshot.clone()))
+            .collect()
+    }
+
+    pub(crate) fn other_transactions_active(&self) -> bool {
+        self.sessions
+            .iter()
+            .any(|session| session.id != self.exec_session && session.txn.is_some())
+    }
+
+    pub(crate) fn explicit_transaction(&self) -> bool {
+        self.sessions
+            .iter()
+            .find(|session| session.id == self.exec_session)
+            .and_then(|session| session.txn.as_ref())
+            .is_some_and(|txn| txn.explicit)
+    }
+
+    pub(crate) fn current_snapshot(&self) -> io::Result<Snapshot> {
+        if let Some(txn) = self.session(self.exec_session)?.txn.as_ref() {
+            return Ok(txn.snapshot.clone());
+        }
+        // Operators can be pulled outside a statement. They see every
+        // committed version and nothing this process has left uncommitted.
+        Ok(Snapshot {
+            xid: 0,
+            bound: self.next_xid,
+            active: BTreeSet::new(),
+        })
+    }
+
+    pub(crate) fn current_xid(&self) -> io::Result<u64> {
+        self.session(self.exec_session)?
+            .txn
+            .as_ref()
+            .map(|txn| txn.xid)
+            .ok_or_else(no_transaction)
+    }
+
+    pub(crate) fn record_write(&mut self, entry: WriteEntry) -> io::Result<()> {
+        let index = self.session_index(self.exec_session)?;
+        self.sessions[index]
+            .txn
+            .as_mut()
+            .ok_or_else(no_transaction)?
+            .write_set
+            .push(entry);
+        Ok(())
+    }
+
+    fn record_created_table(&mut self, created: CreatedTable) -> io::Result<()> {
+        let index = self.session_index(self.exec_session)?;
+        self.sessions[index]
+            .txn
+            .as_mut()
+            .ok_or_else(no_transaction)?
+            .created_tables
+            .push(created);
+        Ok(())
+    }
+
+    pub(crate) fn set_exec_session(&mut self, id: SessionId) -> io::Result<()> {
+        self.session_index(id)?;
+        self.exec_session = id;
+        Ok(())
+    }
+
+    pub(crate) fn exec_session(&self) -> SessionId {
+        self.exec_session
     }
 
     /// Returns the schema named `name`, ignoring ASCII case.
@@ -399,6 +833,16 @@ impl Database {
     pub fn tables(&self) -> &[TableSchema] {
         &self.tables
     }
+}
+
+fn no_transaction() -> io::Error {
+    io::Error::new(ErrorKind::InvalidInput, "no transaction in progress")
+}
+
+fn read_u64(bytes: &[u8]) -> u64 {
+    let mut buf = [0u8; 8];
+    buf.copy_from_slice(&bytes[..8]);
+    u64::from_le_bytes(buf)
 }
 
 fn load_tables(records: &mut RecordFile) -> io::Result<Vec<TableSchema>> {

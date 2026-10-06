@@ -23,7 +23,7 @@ fn rows_persist_after_reopen() {
             ],
         )
         .expect("create");
-        alice = db
+        let inserted = db
             .insert(
                 "users",
                 &[
@@ -36,7 +36,7 @@ fn rows_persist_after_reopen() {
         let updated = db
             .update(
                 "users",
-                alice,
+                inserted,
                 &[
                     Value::Integer(1),
                     Value::Text("Alicia".to_string()),
@@ -44,20 +44,15 @@ fn rows_persist_after_reopen() {
                 ],
             )
             .expect("update");
-        assert_eq!(updated, alice);
-        db.insert(
-            "users",
-            &[Value::Integer(2), Value::Null, Value::Integer(4)],
-        )
-        .expect("second");
-        db.delete(
-            "users",
-            RecordId {
-                page_id: PageId(2),
-                slot_id: 1,
-            },
-        )
-        .expect("delete");
+        assert_ne!(updated, inserted);
+        let second = db
+            .insert(
+                "users",
+                &[Value::Integer(2), Value::Null, Value::Integer(4)],
+            )
+            .expect("second");
+        db.delete("users", second).expect("delete");
+        alice = updated;
     }
 
     let mut db = Database::open(&path).expect("reopen");
@@ -73,17 +68,15 @@ fn rows_persist_after_reopen() {
             ]
         )]
     );
-    let missing = db
-        .get(
-            "users",
-            RecordId {
-                page_id: PageId(2),
-                slot_id: 1,
-            },
-        )
-        .expect_err("deleted");
+    let missing = db.get(
+        "users",
+        RecordId {
+            page_id: PageId(2),
+            slot_id: 0,
+        },
+    );
+    let missing = missing.expect_err("old version");
     assert_eq!(missing.kind(), ErrorKind::NotFound);
-    assert_eq!(missing.to_string(), "record not found: 2:1");
 }
 
 #[test]
@@ -180,8 +173,10 @@ fn update_moves_when_the_row_does_not_fit() {
                 Value::Integer(3),
             ],
         )
-        .expect("in place");
-    assert_eq!(kept, second);
+        .expect("new version");
+    assert_ne!(kept, second);
+    let err = db.get("users", second).expect_err("old version");
+    assert_eq!(err.kind(), ErrorKind::NotFound);
 
     let moved = db
         .update(
@@ -203,7 +198,10 @@ fn update_moves_when_the_row_does_not_fit() {
     assert_eq!(scanned.len(), 2);
     assert_eq!(scanned.iter().filter(|(id, _)| *id == moved).count(), 1);
     assert_eq!(scanned.iter().filter(|(id, _)| *id == first).count(), 0);
-    assert_eq!(scanned[1].1[1], Value::Text("c".repeat(2100)));
+    assert_eq!(scanned.iter().filter(|(id, _)| *id == kept).count(), 1);
+    assert!(scanned
+        .iter()
+        .any(|(_, values)| values[1] == Value::Text("c".repeat(2100))));
 }
 
 #[test]

@@ -342,9 +342,9 @@ impl RecordFile {
         self.pages.release_savepoint()
     }
 
-    /// Drops dirty frames and unflushed allocations.
-    pub(crate) fn discard_dirty(&mut self) -> io::Result<()> {
-        self.pages.discard_dirty()
+    /// See [`BufferPool::wal_commit_pending`](crate::buffer::BufferPool::wal_commit_pending).
+    pub(crate) fn wal_commit_pending(&self) -> bool {
+        self.pages.wal_commit_pending()
     }
 
     /// Frames held by the pool, including overflow past the configured capacity.
@@ -657,7 +657,7 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_three() {
+    fn format_version_is_four() {
         let db = TempDb::new("version");
         {
             let mut file = RecordFile::open(db.path()).unwrap();
@@ -673,7 +673,7 @@ mod tests {
             .unwrap();
         }
         let mut pages = PageManager::open(db.path()).unwrap();
-        assert_eq!(pages.format_version().unwrap(), 3);
+        assert_eq!(pages.format_version().unwrap(), 4);
         let header = pages.read_page(PageId(0)).unwrap();
         assert_eq!(&header.data()[..8], b"SQLTOYDB");
     }

@@ -20,6 +20,7 @@ are in `docs/adr/`:
 - ADR-0012 fixes transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, statement
   atomicity, and no-steal rollback.
 - ADR-0013 fixes the write-ahead log and crash recovery.
+- ADR-0014 fixes multi-version concurrency: sessions, snapshots, and `VACUUM`.
 
 ## Status
 
@@ -31,11 +32,11 @@ step 3, per ADR-0004) stores variable-length records in slotted pages and
 addresses them with stable record ids. Each record page belongs to one table.
 The Catalog (ADR-0002 step 4, per ADR-0005) is done: table schemas are stored
 in the database file and restored when the file is opened. The header format
-version is 3. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
+version is 4. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
 typed rows, including NULL, can be inserted, scanned, updated, and deleted.
-An update that no longer fits on its page is stored at a new record id. The
-SQL parser (ADR-0002 step 6, per ADR-0007) is done: `CREATE TABLE`, `INSERT`,
-`SELECT`, `UPDATE`, and `DELETE` parse into an AST, including `WHERE` and
+An update stores a new version and marks the old one deleted. The SQL parser
+(ADR-0002 step 6, per ADR-0007) is done: `CREATE TABLE`, `INSERT`, `SELECT`,
+`UPDATE`, `DELETE`, and `VACUUM` parse into an AST, including `WHERE` and
 expressions. The executor (ADR-0002 step 7, per ADR-0008) is done: those
 statements run from the library and from `sqltoy sql` / `sqltoy repl`. This
 is the first SQL milestone. The primary-key index (ADR-0002 step 8, per
@@ -55,18 +56,25 @@ cached. Only a clean frame is evicted. When every frame is dirty the pool
 grows past its configured size and shrinks back after commit or rollback.
 A flush with no dirty pages does not touch the files. Transactions
 (ADR-0002 step 11, per ADR-0012) are done. `BEGIN` keeps later changes in
-dirty frames until `COMMIT` flushes them or `ROLLBACK` drops them. A
-statement outside a transaction commits itself when it succeeds. A statement
-that fails is undone, including inside an open transaction, which then
-continues. `Database::insert`, `update`, `delete`, `insert_all`,
-`apply_update`, and `create_table` are each one statement. Dropping a
-database does not flush, so an open transaction is lost. The WAL and
-recovery (ADR-0002 step 12, per ADR-0013) are done. A commit appends the
+dirty frames until `COMMIT` or `ROLLBACK`. Commit sets the version flags and
+flushes. Rollback undoes that session's write set and flushes; it does not
+drop another session's dirty pages. A statement outside a transaction
+commits itself when it succeeds. A statement that fails is undone, including
+inside an open transaction, which then continues. `Database::insert`,
+`update`, `delete`, `insert_all`, `apply_update`, and `create_table` are
+each one statement. Dropping a database does not flush, so an open
+transaction is lost. The WAL and recovery (ADR-0002 step 12, per ADR-0013)
+are done. A commit appends the
 dirty page images and a commit record to `{db}-wal`, syncs that log, writes
 the same pages into the database file, and truncates the log to its header.
 Opening the file replays any commit the log still holds. A torn or corrupt
 tail is ignored, and the log is truncated so the next commit is not appended
-after it.
+after it. Multi-version concurrency (ADR-0002 step 13, per ADR-0014) is
+done. Each session has its own snapshot. A scan or index lookup returns only
+versions visible to that snapshot. `VACUUM` removes versions that every
+active snapshot has stopped seeing. If a commit flushes another session's
+uncommitted versions, the header cleanup flag is set and the next open
+removes them.
 
 ## Build and test
 
@@ -182,9 +190,9 @@ INSERT 2
 
 `repl` prints buffer-pool counters with `.stats` when no statement is in
 progress. The numbers are cumulative since the database was opened. In this
-session the new pages were allocated in the pool, so every read was a hit
-and the file was not read back. `CREATE TABLE` and `INSERT` wrote 4 pages
-and synced at the end of each statement:
+session the header was read from the file once; every later read hit the
+pool. Each statement commits a transaction id into the header, so the two
+`SELECT`s write a page as well as `CREATE TABLE` and `INSERT`:
 
 ```bash
 cargo run --quiet -- repl /tmp/sqltoy-buffer.db <<'EOF'
@@ -208,16 +216,17 @@ INSERT 2
 ----+-------
   1 | Alice 
 (1 row)
-logical reads: 14, hits: 14, misses: 0, pages written: 4, evictions: 0
+logical reads: 23, hits: 22, misses: 1, pages written: 8, evictions: 0
 ```
 
 ## Transactions
 
-`BEGIN` starts a transaction. `COMMIT` writes its dirty pages and syncs.
-`ROLLBACK` drops those pages, so the file is unchanged. A statement that
-fails undoes only its own changes. The prompt is `sqltoy*> ` while a
-transaction is open, when stdin is a terminal. At the end of input, an open
-transaction is rolled back and the REPL prints a warning.
+`BEGIN` starts a transaction on the current session. `COMMIT` sets commit
+flags on that session's versions and flushes. `ROLLBACK` undoes the write
+set and flushes. A statement that fails undoes only its own changes. The
+prompt is `sqltoy*> ` while a transaction is open, when stdin is a terminal.
+At the end of input, an open transaction is rolled back and the REPL prints
+a warning.
 
 ```bash
 cargo run --quiet -- repl /tmp/sqltoy-txn.db <<'EOF'
@@ -279,6 +288,88 @@ A later `SELECT * FROM t` is a new process and prints no rows:
  id 
 ----
 (0 rows)
+```
+
+## MVCC
+
+`.session NAME` switches the REPL to a session. Names are case-sensitive and
+match `[A-Za-z0-9_]+`. The first session is `main`. A new name starts a
+session. When stdin is a terminal the prompt is `sqltoy> ` for `main` and
+`sqltoy:NAME> ` for any other session, with a `*` while that session's
+transaction is open. Piped input below is not a terminal, so it prints no
+prompt.
+
+Session `b` starts a snapshot, then session `a` inserts a row and commits.
+`b` still sees the old snapshot. After `b` commits, a new statement sees the
+insert. `a` then loses a write-write conflict, `b` rolls back, the update is
+retried, and `VACUUM` removes the old version:
+
+```bash
+cargo run --quiet -- repl /tmp/sqltoy-mvcc.db <<'EOF'
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+INSERT INTO users VALUES (1, 'Ann');
+.session b
+BEGIN;
+SELECT id, name FROM users ORDER BY id;
+.session a
+BEGIN;
+INSERT INTO users VALUES (2, 'Bea');
+.session b
+SELECT id, name FROM users ORDER BY id;
+.session a
+COMMIT;
+.session b
+SELECT id, name FROM users ORDER BY id;
+COMMIT;
+SELECT id, name FROM users ORDER BY id;
+BEGIN;
+UPDATE users SET name = 'Ann2' WHERE id = 1;
+.session a
+UPDATE users SET name = 'nope' WHERE id = 1;
+.session b
+ROLLBACK;
+UPDATE users SET name = 'Ann2' WHERE id = 1;
+VACUUM;
+.quit
+EOF
+```
+
+```text
+CREATE TABLE
+INSERT 1
+BEGIN
+ id | name 
+----+------
+  1 | Ann  
+(1 row)
+BEGIN
+INSERT 1
+ id | name 
+----+------
+  1 | Ann  
+(1 row)
+COMMIT
+ id | name 
+----+------
+  1 | Ann  
+(1 row)
+COMMIT
+ id | name 
+----+------
+  1 | Ann  
+  2 | Bea  
+(2 rows)
+BEGIN
+UPDATE 1
+ROLLBACK
+UPDATE 1
+VACUUM 1
+```
+
+Stderr is the conflict:
+
+```text
+error: serialization failure: row was modified by a concurrent transaction
 ```
 
 ## WAL and recovery

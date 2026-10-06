@@ -83,6 +83,7 @@ pub(crate) enum Keyword {
     Transaction,
     True,
     Update,
+    Vacuum,
     Values,
     Where,
 }
@@ -127,6 +128,7 @@ impl Keyword {
             Keyword::Transaction => "TRANSACTION",
             Keyword::True => "TRUE",
             Keyword::Update => "UPDATE",
+            Keyword::Vacuum => "VACUUM",
             Keyword::Values => "VALUES",
             Keyword::Where => "WHERE",
         }
@@ -171,6 +173,7 @@ impl Keyword {
             "transaction" => Keyword::Transaction,
             "true" => Keyword::True,
             "update" => Keyword::Update,
+            "vacuum" => Keyword::Vacuum,
             "values" => Keyword::Values,
             "where" => Keyword::Where,
             _ => return None,
@@ -578,10 +581,10 @@ mod tests {
 
     #[test]
     fn keywords_are_case_insensitive_and_maximal() {
-        let words = "AND AS ASC BEGIN BY COMMIT CREATE CROSS DELETE DESC FALSE FROM INNER INSERT INTEGER INTO IS JOIN KEY LEFT LIMIT NOT NULL OFFSET ON OR ORDER OUTER PRIMARY ROLLBACK SELECT SET TABLE TEXT TRANSACTION TRUE UPDATE VALUES WHERE";
+        let words = "AND AS ASC BEGIN BY COMMIT CREATE CROSS DELETE DESC FALSE FROM INNER INSERT INTEGER INTO IS JOIN KEY LEFT LIMIT NOT NULL OFFSET ON OR ORDER OUTER PRIMARY ROLLBACK SELECT SET TABLE TEXT TRANSACTION TRUE UPDATE VACUUM VALUES WHERE";
         for sql in [words, &words.to_ascii_lowercase()] {
             let tokens = tokenize(sql).unwrap();
-            assert_eq!(tokens.len(), 40);
+            assert_eq!(tokens.len(), 41);
             for token in &tokens[..tokens.len() - 1] {
                 assert!(matches!(token.kind, TokenKind::Keyword(_)), "{token:?}");
             }

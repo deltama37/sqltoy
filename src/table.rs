@@ -1,16 +1,22 @@
 //! Insert, scan, update, and delete of typed rows.
 //!
-//! Values are checked against the catalog schema and stored as one record
-//! per row. When an updated row no longer fits on its page, it is inserted
-//! at a new record id and the old row is deleted. A primary key is kept in
-//! the table's B+Tree: it cannot be NULL, and it is unique.
+//! Values are checked against the catalog schema. Each stored row is a
+//! version: an insert creates one, a delete sets `xmax`, and an update does
+//! both. The old bytes are not rewritten in place. A primary key is kept in
+//! the table's B+Tree as `(key, record id)`, so older versions stay
+//! reachable until `VACUUM`. It cannot be NULL, and at most one version of
+//! a key is visible to a transaction.
 
 use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
 
 use crate::btree::BTree;
-use crate::catalog::{Database, TableSchema};
-use crate::record::{RecordId, TableId};
+use crate::catalog::{Database, TableSchema, WriteEntry, WriteKind};
+use crate::mvcc::{
+    clear_xmax, committed_in, encode_record, serialization_failure, set_xmax, split_record,
+    visible, Snapshot, VersionHeader,
+};
+use crate::record::{RecordId, TableId, MAX_RECORD_SIZE};
 use crate::row::{decode_row, encode_row, Value};
 
 impl Database {
@@ -62,17 +68,26 @@ impl Database {
             keys.push(primary_key_value(&schema, values)?);
         }
         let mut seen = BTreeSet::new();
+        let replacing = BTreeSet::new();
         for key in keys.iter().flatten() {
-            if !seen.insert(*key) || self.index_contains(&schema, *key)? {
+            if !seen.insert(*key) {
                 return Err(duplicate_key(*key));
             }
+            self.check_key_available(&schema, *key, &replacing)?;
         }
+        let xid = self.current_xid()?;
         let mut ids = Vec::with_capacity(encoded.len());
-        for (bytes, key) in encoded.iter().zip(&keys) {
-            let id = self.records.insert(schema.id, bytes)?;
+        for (row, key) in encoded.iter().zip(&keys) {
+            let id = self.insert_version(&schema, xid, row)?;
             if let Some(key) = key {
                 self.index_insert(&schema, *key, id)?;
             }
+            self.record_write(WriteEntry {
+                table: schema.id,
+                rid: id,
+                key: *key,
+                kind: WriteKind::Inserted,
+            })?;
             ids.push(id);
         }
         Ok(ids)
@@ -83,9 +98,7 @@ impl Database {
     /// An unknown table or a missing row is [`ErrorKind::NotFound`]. A stored
     /// record that does not match the schema is [`ErrorKind::InvalidData`].
     pub fn get(&mut self, table: &str, id: RecordId) -> io::Result<Vec<Value>> {
-        let schema = self.require_table(table)?;
-        let bytes = self.records.get(schema.id, id)?;
-        decode_row(&schema, id, &bytes)
+        self.in_statement(|db| db.read_visible(table, id))
     }
 
     /// Rows of `table` with their record ids, in page order then slot order.
@@ -93,32 +106,72 @@ impl Database {
     /// An unknown table is [`ErrorKind::NotFound`]. A stored record that
     /// cannot be decoded with the schema is [`ErrorKind::InvalidData`].
     pub fn scan(&mut self, table: &str) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
-        let schema = self.require_table(table)?;
-        let rows = self.records.scan(schema.id)?;
-        rows.into_iter()
-            .map(|(id, bytes)| Ok((id, decode_row(&schema, id, &bytes)?)))
-            .collect()
+        self.in_statement(|db| {
+            let schema = db.require_table(table)?;
+            db.visible_rows(&schema)
+        })
     }
 
-    /// Replaces the row identified by `id`.
+    /// Live records in `table`, including versions the current snapshot cannot see.
+    pub fn stored_version_count(&mut self, table: &str) -> io::Result<usize> {
+        let schema = self.require_table(table)?;
+        Ok(self.records.scan(schema.id)?.len())
+    }
+
+    /// Primary-key index entries, including versions that are not visible.
     ///
-    /// The checks match [`Self::insert`] and run before the row is replaced.
-    /// When the new bytes fit on the same page, the record id is unchanged.
-    /// When they do not, the new row is inserted and the old row is deleted
-    /// afterward, and the new id is returned. A crash between those writes
-    /// can leave both copies.
+    /// `Ok(None)` when the table has no primary key.
+    pub fn index_entry_count(&mut self, table: &str) -> io::Result<Option<usize>> {
+        let schema = self.require_table(table)?;
+        let Some(root) = schema.index_root else {
+            return Ok(None);
+        };
+        let tree = BTree::open(root, schema.id);
+        Ok(Some(tree.scan_all(self.records.pages_mut())?.len()))
+    }
+
+    /// Decodes `bytes` when the version is visible to the executing transaction.
+    pub(crate) fn visible_values(
+        &self,
+        schema: &TableSchema,
+        id: RecordId,
+        bytes: &[u8],
+    ) -> io::Result<Option<Vec<Value>>> {
+        let (header, row) = split_record(id, bytes)?;
+        if !visible(&header, &self.current_snapshot()?) {
+            return Ok(None);
+        }
+        Ok(Some(decode_row(schema, id, row)?))
+    }
+
+    /// Reads `id` when it is visible. `Ok(None)` when the version is not visible.
     ///
-    /// If the primary key or the record id changes, the old index entry is
-    /// removed and the new key is inserted. A duplicate of another row's key
-    /// is rejected before either write.
+    /// A missing record is [`ErrorKind::NotFound`].
+    pub(crate) fn row_if_visible(
+        &mut self,
+        schema: &TableSchema,
+        id: RecordId,
+    ) -> io::Result<Option<Vec<Value>>> {
+        let bytes = self.records.get(schema.id, id)?;
+        self.visible_values(schema, id, &bytes)
+    }
+
+    /// Replaces the visible version identified by `id` with a new version.
     ///
-    /// An unknown table or a missing row is [`ErrorKind::NotFound`]. A count
-    /// mismatch, a type mismatch, a NULL primary key, a duplicate primary
-    /// key, or a row longer than the maximum record length is
-    /// [`ErrorKind::InvalidInput`].
+    /// The old version stays in the table with `xmax` set to this transaction.
+    /// The new version is a separate record. The returned id is that record,
+    /// which is different from `id`. The checks match [`Self::insert`] and run
+    /// before either version is written. A concurrent writer that has already
+    /// set `xmax` produces [`ErrorKind::Other`]
+    /// (`serialization failure: row was modified by a concurrent transaction`).
+    ///
+    /// An unknown table or a version this transaction cannot see is
+    /// [`ErrorKind::NotFound`]. A count mismatch, a type mismatch, a NULL
+    /// primary key, a duplicate primary key, or a row longer than the maximum
+    /// record length is [`ErrorKind::InvalidInput`].
     ///
     /// Outside a transaction the buffer pool is flushed before this returns.
-    /// A failed call leaves the row unchanged.
+    /// A failed call leaves both versions unchanged.
     pub fn update(&mut self, table: &str, id: RecordId, values: &[Value]) -> io::Result<RecordId> {
         self.in_statement(|db| db.update_unflushed(table, id, values))
     }
@@ -129,44 +182,26 @@ impl Database {
         id: RecordId,
         values: &[Value],
     ) -> io::Result<RecordId> {
-        let schema = self.require_table(table)?;
-        let bytes = encode_row(&schema, values)?;
-        let new_key = primary_key_value(&schema, values)?;
-        let old_key = if let Some(index) = schema.primary_key {
-            Some(require_primary_key(
-                &schema,
-                &self.read_row(&schema, id)?,
-                index,
-            )?)
-        } else {
-            None
-        };
-        if let (Some(new_key), Some(old_key)) = (new_key, old_key) {
-            if new_key != old_key && self.index_contains(&schema, new_key)? {
-                return Err(duplicate_key(new_key));
-            }
-        }
-        let new_id = self.write_row(schema.id, id, &bytes)?;
-        if let (Some(new_key), Some(old_key)) = (new_key, old_key) {
-            if new_id != id || new_key != old_key {
-                self.index_delete(&schema, old_key)?;
-                self.index_insert(&schema, new_key, new_id)?;
-            }
-        }
-        Ok(new_id)
+        let mut ids = self.apply_update_unflushed(table, &[(id, values.to_vec())])?;
+        Ok(ids.remove(0))
     }
 
     /// Applies `pending` updates, or none of them.
     ///
-    /// Every new row is encoded first. When the table has a primary key, the
-    /// keys of rows that are not in `pending`, plus the new keys, must be
-    /// unique. Old keys of the updated rows are then removed from the index,
-    /// and each row is written and inserted under its new key. That order
-    /// lets `id = id + 1` succeed. A duplicate or NULL key writes nothing.
+    /// Every new row is encoded first, then every target is checked for
+    /// visibility and write-write conflicts. When the table has a primary key,
+    /// the new keys must be unique among themselves and against versions that
+    /// are not being replaced. The versions in `pending` are part of that
+    /// check, so `id = id + 1` succeeds. A duplicate, NULL key, or conflict
+    /// writes nothing.
     ///
-    /// Returns the record id of each row after the write, in `pending` order.
+    /// Each update deletes the old version and inserts a new one. The old
+    /// index entry stays until [`Self::execute_statement`] runs `VACUUM` or
+    /// the transaction rolls back an insert. Returns the new record id of
+    /// each row, in `pending` order.
+    ///
     /// Outside a transaction the buffer pool is flushed before this returns.
-    /// A failed call leaves every row unchanged.
+    /// A failed call leaves every version unchanged.
     pub fn apply_update(
         &mut self,
         table: &str,
@@ -188,36 +223,55 @@ impl Database {
             return Ok(Vec::new());
         }
         let mut encoded = Vec::with_capacity(pending.len());
-        for (_, values) in pending {
-            encoded.push(encode_row(&schema, values)?);
-        }
-        if schema.primary_key.is_none() {
-            let mut ids = Vec::with_capacity(pending.len());
-            for (index, (id, _)) in pending.iter().enumerate() {
-                ids.push(self.write_row(schema.id, *id, &encoded[index])?);
-            }
-            return Ok(ids);
-        }
-
-        let index = schema.primary_key.expect("primary key checked above");
         let mut new_keys = Vec::with_capacity(pending.len());
         for (_, values) in pending {
-            new_keys.push(require_primary_key(&schema, values, index)?);
+            encoded.push(encode_row(&schema, values)?);
+            new_keys.push(primary_key_value(&schema, values)?);
         }
-        let mut old_keys = Vec::with_capacity(pending.len());
-        for (id, _) in pending {
-            let old = self.read_row(&schema, *id)?;
-            old_keys.push(require_primary_key(&schema, &old, index)?);
-        }
-        self.ensure_updated_keys_unique(&schema, &old_keys, &new_keys)?;
 
-        for key in &old_keys {
-            self.index_delete(&schema, *key)?;
+        let snapshot = self.current_snapshot()?;
+        let active = self.active_xid_set();
+        let mut old_keys = Vec::with_capacity(pending.len());
+        let mut replacing = BTreeSet::new();
+        for (id, _) in pending {
+            let bytes = self.records.get(schema.id, *id)?;
+            let (header, row) = split_record(*id, &bytes)?;
+            if !visible(&header, &snapshot) {
+                return Err(not_found(*id));
+            }
+            ensure_conflict(&header, &snapshot, &active)?;
+            let old = decode_row(&schema, *id, row)?;
+            old_keys.push(primary_key_value(&schema, &old)?);
+            replacing.insert(*id);
         }
+        let mut claimed = BTreeSet::new();
+        for key in new_keys.iter().flatten() {
+            if !claimed.insert(*key) {
+                return Err(duplicate_key(*key));
+            }
+            self.check_key_available(&schema, *key, &replacing)?;
+        }
+
+        let xid = snapshot.xid;
         let mut ids = Vec::with_capacity(pending.len());
         for (index, (id, _)) in pending.iter().enumerate() {
-            let new_id = self.write_row(schema.id, *id, &encoded[index])?;
-            self.index_insert(&schema, new_keys[index], new_id)?;
+            self.mark_deleted(schema.id, *id, xid)?;
+            self.record_write(WriteEntry {
+                table: schema.id,
+                rid: *id,
+                key: old_keys[index],
+                kind: WriteKind::Deleted,
+            })?;
+            let new_id = self.insert_version(&schema, xid, &encoded[index])?;
+            if let Some(key) = new_keys[index] {
+                self.index_insert(&schema, key, new_id)?;
+            }
+            self.record_write(WriteEntry {
+                table: schema.id,
+                rid: new_id,
+                key: new_keys[index],
+                kind: WriteKind::Inserted,
+            })?;
             ids.push(new_id);
         }
         Ok(ids)
@@ -235,74 +289,115 @@ impl Database {
         Ok(Some(tree.height(self.records.pages_mut())?))
     }
 
-    /// Deletes the row identified by `id` in `table`.
+    /// Deletes the visible version identified by `id`.
     ///
-    /// An unknown table or a missing row is [`ErrorKind::NotFound`]. When the
-    /// table has a primary key, the key is removed after the row.
+    /// Sets `xmax` to this transaction. The record and its index entry stay
+    /// until `VACUUM`, crash cleanup, or rollback. An unknown table or a
+    /// version this transaction cannot see is [`ErrorKind::NotFound`]. A
+    /// concurrent writer produces the same serialization failure as
+    /// [`Self::update`].
     ///
     /// Outside a transaction the buffer pool is flushed before this returns.
-    /// A failed call leaves the row in place.
+    /// A failed call leaves the version unchanged.
     pub fn delete(&mut self, table: &str, id: RecordId) -> io::Result<()> {
         self.in_statement(|db| db.delete_unflushed(table, id))
     }
 
-    /// Deletes one row without flushing.
+    /// Deletes one version without flushing.
     ///
     /// [`Self::execute_statement`] flushes once after the statement, not after
     /// each row.
     pub(crate) fn delete_unflushed(&mut self, table: &str, id: RecordId) -> io::Result<()> {
         let schema = self.require_table(table)?;
-        let key = if schema.primary_key.is_some() {
-            primary_key_value(&schema, &self.read_row(&schema, id)?)?
-        } else {
-            None
-        };
-        self.records.delete(schema.id, id)?;
-        if let Some(key) = key {
-            self.index_delete(&schema, key)?;
+        let bytes = self.records.get(schema.id, id)?;
+        let (header, row) = split_record(id, &bytes)?;
+        let snapshot = self.current_snapshot()?;
+        if !visible(&header, &snapshot) {
+            return Err(not_found(id));
         }
+        ensure_conflict(&header, &snapshot, &self.active_xid_set())?;
+        let values = decode_row(&schema, id, row)?;
+        let key = primary_key_value(&schema, &values)?;
+        self.mark_deleted(schema.id, id, snapshot.xid)?;
+        self.record_write(WriteEntry {
+            table: schema.id,
+            rid: id,
+            key,
+            kind: WriteKind::Deleted,
+        })?;
         Ok(())
     }
 
-    fn read_row(&mut self, schema: &TableSchema, id: RecordId) -> io::Result<Vec<Value>> {
-        let bytes = self.records.get(schema.id, id)?;
-        decode_row(schema, id, &bytes)
-    }
-
-    fn write_row(&mut self, table: TableId, id: RecordId, bytes: &[u8]) -> io::Result<RecordId> {
-        if self.records.try_update(table, id, bytes)? {
-            Ok(id)
-        } else {
-            let new_id = self.records.insert(table, bytes)?;
-            self.records.delete(table, id)?;
-            Ok(new_id)
-        }
-    }
-
-    fn ensure_updated_keys_unique(
+    fn insert_version(
         &mut self,
         schema: &TableSchema,
-        old_keys: &[i64],
-        new_keys: &[i64],
+        xid: u64,
+        row: &[u8],
+    ) -> io::Result<RecordId> {
+        let bytes = encode_record(VersionHeader::created_by(xid), row);
+        if bytes.len() > MAX_RECORD_SIZE {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                format!("row too large for table {}", schema.name),
+            ));
+        }
+        self.records.insert(schema.id, &bytes)
+    }
+
+    /// Rejects `key` when some other version already owns it.
+    ///
+    /// `replacing` versions are the ones this statement is about to delete, so
+    /// they do not count. A version deleted by this transaction, or deleted
+    /// by a commit this snapshot sees, is ignored. A version this snapshot
+    /// still sees but whose delete committed later, and an uncommitted creator
+    /// or deleter other than this transaction, are serialization failures.
+    /// Anything else is a duplicate key.
+    fn check_key_available(
+        &mut self,
+        schema: &TableSchema,
+        key: i64,
+        replacing: &BTreeSet<RecordId>,
     ) -> io::Result<()> {
-        // Keys of the updated rows are removed before the new keys go in, so
-        // only an indexed key that belongs to a row outside the update conflicts.
-        let released: BTreeSet<i64> = old_keys.iter().copied().collect();
-        let mut claimed = BTreeSet::new();
-        for &key in new_keys {
-            if !claimed.insert(key) {
-                return Err(duplicate_key(key));
+        if schema.index_root.is_none() {
+            return Ok(());
+        }
+        let tree = open_index(schema)?;
+        let ids = tree.lookup(self.records.pages_mut(), key)?;
+        let snapshot = self.current_snapshot()?;
+        for id in ids {
+            if replacing.contains(&id) {
+                continue;
             }
-            if !released.contains(&key) && self.index_contains(schema, key)? {
-                return Err(duplicate_key(key));
+            let bytes = self.records.get(schema.id, id)?;
+            let (header, _) = split_record(id, &bytes)?;
+            if header.xmax == snapshot.xid {
+                continue;
             }
+            if header.xmax_committed() {
+                // A delete committed after this snapshot leaves the old version
+                // visible here, so inserting the key would show it twice.
+                if !committed_in(header.xmax, true, &snapshot)
+                    && committed_in(header.xmin, header.xmin_committed(), &snapshot)
+                {
+                    return Err(serialization_failure());
+                }
+                continue;
+            }
+            if !header.xmin_committed() && header.xmin != snapshot.xid {
+                return Err(serialization_failure());
+            }
+            if header.xmax != 0 && !header.xmax_committed() && header.xmax != snapshot.xid {
+                return Err(serialization_failure());
+            }
+            return Err(duplicate_key(key));
         }
         Ok(())
     }
 
-    fn index_contains(&mut self, schema: &TableSchema, key: i64) -> io::Result<bool> {
-        let tree = open_index(schema)?;
-        Ok(tree.get(self.records.pages_mut(), key)?.is_some())
+    fn mark_deleted(&mut self, table: TableId, id: RecordId, xid: u64) -> io::Result<()> {
+        let mut bytes = self.records.get(table, id)?;
+        set_xmax(&mut bytes, xid)?;
+        self.records.update(table, id, &bytes)
     }
 
     fn index_insert(&mut self, schema: &TableSchema, key: i64, id: RecordId) -> io::Result<()> {
@@ -310,10 +405,136 @@ impl Database {
         tree.insert(self.records.pages_mut(), key, id)
     }
 
-    fn index_delete(&mut self, schema: &TableSchema, key: i64) -> io::Result<()> {
+    fn index_delete(&mut self, schema: &TableSchema, key: i64, id: RecordId) -> io::Result<()> {
         let tree = open_index(schema)?;
-        tree.delete(self.records.pages_mut(), key)?;
+        if !tree.delete(self.records.pages_mut(), key, id)? {
+            return Err(io::Error::new(
+                ErrorKind::InvalidData,
+                format!("missing index entry: {key} {id}"),
+            ));
+        }
         Ok(())
+    }
+
+    pub(crate) fn undo_inserted(&mut self, entry: &WriteEntry) -> io::Result<()> {
+        if let Some(key) = entry.key {
+            let schema = self.schema_by_id(entry.table)?;
+            self.index_delete(&schema, key, entry.rid)?;
+        }
+        self.records.delete(entry.table, entry.rid)
+    }
+
+    pub(crate) fn undo_deleted(&mut self, entry: &WriteEntry) -> io::Result<()> {
+        let mut bytes = self.records.get(entry.table, entry.rid)?;
+        clear_xmax(&mut bytes)?;
+        self.records.update(entry.table, entry.rid, &bytes)
+    }
+
+    /// Drops versions whose creator never committed, and clears `xmax` when
+    /// the deleter never committed.
+    ///
+    /// Catalog records are not versions and are left alone. A table created
+    /// by a transaction that another session flushed therefore remains after
+    /// recovery.
+    pub(crate) fn purge_aborted_versions(&mut self) -> io::Result<()> {
+        let schemas = self.tables().to_vec();
+        for schema in schemas {
+            let rows = self.records.scan(schema.id)?;
+            for (id, bytes) in rows {
+                let Some(header) = VersionHeader::decode(&bytes) else {
+                    self.records.delete(schema.id, id)?;
+                    continue;
+                };
+                if !header.xmin_committed() {
+                    self.remove_index_entry(&schema, id, &bytes)?;
+                    self.records.delete(schema.id, id)?;
+                } else if header.xmax != 0 && !header.xmax_committed() {
+                    let mut bytes = bytes;
+                    clear_xmax(&mut bytes)?;
+                    self.records.update(schema.id, id, &bytes)?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Removes dead versions whose `xmax` is committed for every active snapshot.
+    ///
+    /// Returns how many versions were removed. Does not record them in a write
+    /// set: the caller flushes after this returns.
+    pub(crate) fn vacuum_dead_versions(&mut self) -> io::Result<u64> {
+        let snapshots = self.active_snapshots();
+        let schemas = self.tables().to_vec();
+        let mut removed = 0u64;
+        for schema in schemas {
+            let rows = self.records.scan(schema.id)?;
+            for (id, bytes) in rows {
+                let (header, _) = split_record(id, &bytes)?;
+                if !header.xmax_committed() {
+                    continue;
+                }
+                let dead = snapshots.iter().all(|snapshot| {
+                    header.xmax < snapshot.bound && !snapshot.active.contains(&header.xmax)
+                });
+                if !dead {
+                    continue;
+                }
+                self.remove_index_entry(&schema, id, &bytes)?;
+                self.records.delete(schema.id, id)?;
+                removed += 1;
+            }
+        }
+        Ok(removed)
+    }
+
+    fn remove_index_entry(
+        &mut self,
+        schema: &TableSchema,
+        id: RecordId,
+        bytes: &[u8],
+    ) -> io::Result<()> {
+        if schema.index_root.is_none() {
+            return Ok(());
+        }
+        if let Some(key) = version_key(schema, id, bytes)? {
+            let tree = open_index(schema)?;
+            tree.delete(self.records.pages_mut(), key, id)?;
+            return Ok(());
+        }
+        let tree = open_index(schema)?;
+        let entries = tree.scan_all(self.records.pages_mut())?;
+        for (key, rid) in entries {
+            if rid == id {
+                tree.delete(self.records.pages_mut(), key, rid)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn schema_by_id(&self, id: TableId) -> io::Result<TableSchema> {
+        self.tables()
+            .iter()
+            .find(|table| table.id == id)
+            .cloned()
+            .ok_or_else(|| {
+                io::Error::new(ErrorKind::NotFound, format!("table not found: {}", id.0))
+            })
+    }
+
+    fn visible_rows(&mut self, schema: &TableSchema) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
+        let mut rows = Vec::new();
+        for (id, bytes) in self.records.scan(schema.id)? {
+            if let Some(values) = self.visible_values(schema, id, &bytes)? {
+                rows.push((id, values));
+            }
+        }
+        Ok(rows)
+    }
+
+    fn read_visible(&mut self, table: &str, id: RecordId) -> io::Result<Vec<Value>> {
+        let schema = self.require_table(table)?;
+        self.row_if_visible(&schema, id)?
+            .ok_or_else(|| not_found(id))
     }
 
     fn require_table(&self, name: &str) -> io::Result<TableSchema> {
@@ -363,6 +584,35 @@ fn duplicate_key(key: i64) -> io::Error {
         ErrorKind::InvalidInput,
         format!("duplicate primary key: {key}"),
     )
+}
+
+fn not_found(id: RecordId) -> io::Error {
+    io::Error::new(ErrorKind::NotFound, format!("record not found: {id}"))
+}
+
+fn version_key(schema: &TableSchema, id: RecordId, bytes: &[u8]) -> io::Result<Option<i64>> {
+    let (_, row) = split_record(id, bytes)?;
+    let values = decode_row(schema, id, row)?;
+    primary_key_value(schema, &values)
+}
+
+/// First updater wins. `active` is the transactions running now, not the
+/// snapshot's frozen set.
+fn ensure_conflict(
+    header: &VersionHeader,
+    snapshot: &Snapshot,
+    active: &BTreeSet<u64>,
+) -> io::Result<()> {
+    if header.xmax == 0 || header.xmax == snapshot.xid {
+        return Ok(());
+    }
+    let running = active.contains(&header.xmax);
+    let committed_later = header.xmax_committed() && !committed_in(header.xmax, true, snapshot);
+    if running || committed_later {
+        Err(serialization_failure())
+    } else {
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -478,16 +728,18 @@ mod tests {
         let updated = database
             .update("users", alice, &row(1, Some("Alicia"), Some(31)))
             .unwrap();
-        assert_eq!(updated, alice);
+        assert_ne!(updated, alice);
+        let err = database.get("users", alice).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
         assert_eq!(
-            database.get("users", alice).unwrap(),
+            database.get("users", updated).unwrap(),
             row(1, Some("Alicia"), Some(31))
         );
 
         let shrunk = database
-            .update("users", alice, &row(1, Some("Al"), Some(31)))
+            .update("users", updated, &row(1, Some("Al"), Some(31)))
             .unwrap();
-        assert_eq!(shrunk, alice);
+        assert_ne!(shrunk, updated);
 
         database.delete("users", bob).unwrap();
         let err = database.get("users", bob).unwrap_err();
@@ -495,7 +747,7 @@ mod tests {
         assert_eq!(err.to_string(), "record not found: 2:1");
         assert_eq!(
             database.scan("users").unwrap(),
-            vec![(alice, row(1, Some("Al"), Some(31)))]
+            vec![(shrunk, row(1, Some("Al"), Some(31)))]
         );
 
         let err = database.delete("users", bob).unwrap_err();
@@ -627,7 +879,7 @@ mod tests {
     }
 
     #[test]
-    fn update_in_place_keeps_the_record_id() {
+    fn update_creates_a_new_version() {
         let (_db, mut database) = open_users();
         let id = database
             .insert("users", &row(1, Some("Al"), Some(1)))
@@ -635,10 +887,12 @@ mod tests {
         let grown = database
             .update("users", id, &row(1, Some("Alicia"), Some(2)))
             .unwrap();
-        assert_eq!(grown, id);
+        assert_ne!(grown, id);
         assert_eq!(grown.page_id, PageId(2));
+        let err = database.get("users", id).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
         assert_eq!(
-            database.get("users", id).unwrap(),
+            database.get("users", grown).unwrap(),
             row(1, Some("Alicia"), Some(2))
         );
         assert_eq!(database.scan("users").unwrap().len(), 1);
@@ -647,8 +901,8 @@ mod tests {
     #[test]
     fn update_that_does_not_fit_moves_the_row() {
         let (_db, mut database) = open_users();
-        // Two long rows fill the first user page. A longer replacement does
-        // not fit there, so the table layer inserts it and deletes the old one.
+        // An update always stores a new version. The previous record id is
+        // no longer visible.
         let first = database
             .insert("users", &row(1, Some(&"a".repeat(2000)), Some(1)))
             .unwrap();
@@ -667,14 +921,14 @@ mod tests {
         let kept = database
             .update("users", second, &row(2, Some(&"b".repeat(2000)), Some(3)))
             .unwrap();
-        assert_eq!(kept, second);
+        assert_ne!(kept, second);
+        let err = database.get("users", second).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::NotFound);
 
         let moved = database
             .update("users", first, &row(1, Some(&"c".repeat(2100)), Some(1)))
             .unwrap();
         assert_ne!(moved, first);
-        assert_eq!(moved.page_id, PageId(3));
-        assert_eq!(moved.slot_id, 0);
 
         let err = database.get("users", first).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::NotFound);
@@ -684,10 +938,12 @@ mod tests {
         assert_eq!(scanned.len(), 2);
         assert_eq!(scanned.iter().filter(|(id, _)| *id == first).count(), 0);
         assert_eq!(scanned.iter().filter(|(id, _)| *id == moved).count(), 1);
-        assert_eq!(scanned[0].0, second);
-        assert_eq!(scanned[0].1, row(2, Some(&"b".repeat(2000)), Some(3)));
-        assert_eq!(scanned[1].0, moved);
-        assert_eq!(scanned[1].1, row(1, Some(&"c".repeat(2100)), Some(1)));
+        assert!(scanned
+            .iter()
+            .any(|(_, values)| values == &row(2, Some(&"b".repeat(2000)), Some(3))));
+        assert!(scanned
+            .iter()
+            .any(|(_, values)| values == &row(1, Some(&"c".repeat(2100)), Some(1))));
     }
 
     #[test]
@@ -884,27 +1140,31 @@ mod tests {
         assert_ne!(moved, first);
         let schema = database.table("users").unwrap().clone();
         let tree = BTree::open(schema.index_root.unwrap(), schema.id);
-        assert_eq!(
-            tree.get(database.records.pages_mut(), 1).unwrap(),
-            Some(moved)
-        );
+        assert!(tree
+            .lookup(database.records.pages_mut(), 1)
+            .unwrap()
+            .contains(&moved));
         assert_eq!(
             database.get("users", moved).unwrap()[1],
             Value::Text("c".repeat(2500))
         );
 
         database.delete("users", moved).unwrap();
-        assert!(tree.get(database.records.pages_mut(), 1).unwrap().is_none());
+        assert!(database.get("users", moved).is_err());
+        assert!(!tree
+            .lookup(database.records.pages_mut(), 1)
+            .unwrap()
+            .is_empty());
         let again = database
             .insert(
                 "users",
                 &[Value::Integer(1), Value::Text("Ada".to_string())],
             )
             .unwrap();
-        assert_eq!(
-            tree.get(database.records.pages_mut(), 1).unwrap(),
-            Some(again)
-        );
+        assert!(tree
+            .lookup(database.records.pages_mut(), 1)
+            .unwrap()
+            .contains(&again));
 
         let pending = vec![
             (
@@ -916,37 +1176,39 @@ mod tests {
                 vec![Value::Integer(3), Value::Text("b".repeat(2000))],
             ),
         ];
-        database.apply_update("users", &pending).unwrap();
-        let keys: Vec<i64> = tree
-            .scan_all(database.records.pages_mut())
-            .unwrap()
-            .into_iter()
-            .map(|(key, _)| key)
-            .collect();
-        assert_eq!(keys, vec![2, 3]);
+        let updated = database.apply_update("users", &pending).unwrap();
+        assert_eq!(visible_keys(&mut database), vec![2, 3]);
 
         let err = database
             .apply_update(
                 "users",
                 &[
                     (
-                        again,
+                        updated[0],
                         vec![Value::Integer(9), Value::Text("a".repeat(2000))],
                     ),
                     (
-                        second,
+                        updated[1],
                         vec![Value::Integer(9), Value::Text("b".repeat(2000))],
                     ),
                 ],
             )
             .unwrap_err();
         assert_eq!(err.to_string(), "duplicate primary key: 9");
-        let keys: Vec<i64> = tree
-            .scan_all(database.records.pages_mut())
+        assert_eq!(visible_keys(&mut database), vec![2, 3]);
+    }
+
+    fn visible_keys(database: &mut Database) -> Vec<i64> {
+        let mut keys: Vec<i64> = database
+            .scan("users")
             .unwrap()
             .into_iter()
-            .map(|(key, _)| key)
+            .map(|(_, values)| match values[0] {
+                Value::Integer(key) => key,
+                _ => panic!("id"),
+            })
             .collect();
-        assert_eq!(keys, vec![2, 3]);
+        keys.sort();
+        keys
     }
 }

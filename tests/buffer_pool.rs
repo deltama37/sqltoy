@@ -102,7 +102,12 @@ fn run_workload(frames: usize) -> (Vec<QueryResult>, Vec<u8>) {
             .unwrap(),
         );
     }
-    assert_eq!(fs::read(&path).unwrap(), bytes);
+    // The verifying selects commit transaction ids, so the header next-xid
+    // field moves. Row pages stay as the workload left them.
+    let after = fs::read(&path).unwrap();
+    assert_eq!(after.len(), bytes.len());
+    assert_eq!(&after[..16], &bytes[..16]);
+    assert_eq!(&after[24..], &bytes[24..]);
     (results, bytes)
 }
 

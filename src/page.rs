@@ -13,11 +13,18 @@ use crate::storage::Storage;
 pub const PAGE_SIZE: usize = 4096;
 
 const MAGIC: &[u8; 8] = b"SQLTOYDB";
-const FORMAT_VERSION: u32 = 3;
+const FORMAT_VERSION: u32 = 4;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
 const PAGE_SIZE_OFFSET: usize = 12;
+
+/// Header offset of the next transaction id (`u64`, little-endian).
+pub const NEXT_XID_OFFSET: usize = 16;
+
+/// Header offset of the crash-cleanup flag (`u8`). `1` means a flush wrote
+/// another transaction's uncommitted versions.
+pub const CLEANUP_FLAG_OFFSET: usize = 24;
 
 /// Zero-based index of a page within a database file.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
@@ -83,7 +90,7 @@ impl PageManager {
     /// Opens the database at `path`.
     ///
     /// An empty file is initialized with a header page and synced. An existing
-    /// file must carry the sqltoy magic, format version 3, and this build's
+    /// file must carry the sqltoy magic, format version 4, and this build's
     /// page size, and its length must be a positive multiple of [`PAGE_SIZE`].
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<PageManager> {
         let mut storage = Storage::open(path)?;
@@ -202,6 +209,8 @@ fn initialize_header(storage: &mut Storage) -> io::Result<()> {
         .copy_from_slice(&FORMAT_VERSION.to_le_bytes());
     page.data_mut()[PAGE_SIZE_OFFSET..PAGE_SIZE_OFFSET + 4]
         .copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
+    // The first transaction id is 1. Zero means "no transaction".
+    page.data_mut()[NEXT_XID_OFFSET..NEXT_XID_OFFSET + 8].copy_from_slice(&1u64.to_le_bytes());
     storage.write_at(PageId(0).offset(), page.data())?;
     storage.sync()
 }
@@ -293,13 +302,15 @@ mod tests {
         let mut pages = PageManager::open(db.path()).unwrap();
 
         assert_eq!(pages.page_count().unwrap(), 1);
-        assert_eq!(pages.format_version().unwrap(), 3);
+        assert_eq!(pages.format_version().unwrap(), 4);
 
         let header = pages.read_page(PageId(0)).unwrap();
         assert_eq!(&header.data()[..8], b"SQLTOYDB");
-        assert_eq!(&header.data()[8..12], &3u32.to_le_bytes());
+        assert_eq!(&header.data()[8..12], &4u32.to_le_bytes());
         assert_eq!(&header.data()[12..16], &(PAGE_SIZE as u32).to_le_bytes());
-        assert!(header.data()[16..].iter().all(|byte| *byte == 0));
+        assert_eq!(&header.data()[16..24], &1u64.to_le_bytes());
+        assert_eq!(header.data()[24], 0);
+        assert!(header.data()[25..].iter().all(|byte| *byte == 0));
     }
 
     #[test]
@@ -372,7 +383,7 @@ mod tests {
             let mut storage = Storage::open(db.path()).unwrap();
             let mut bytes = vec![0u8; PAGE_SIZE];
             bytes[..8].copy_from_slice(b"SQLTOYDB");
-            // Not version 3. Page size is checked before the version.
+            // Page size is checked before the format version.
             bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
             bytes[12..16].copy_from_slice(&512u32.to_le_bytes());
             storage.write_at(0, &bytes).unwrap();
