@@ -17,13 +17,14 @@
 //! The catalog layer records table schemas in
 //! the file and restores them when the database is opened. The table layer
 //! stores typed rows in those tables, including NULL. The SQL parser turns
-//! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, and `VACUUM` text into an
-//! AST. The executor evaluates expressions, including `WHERE`, and runs those
-//! statements. A primary key is an `INTEGER` column indexed by a B+Tree, so
-//! `WHERE id = 1` can read one row without scanning the table. A `SELECT`
-//! runs as a tree of operators: sequential or index scans, nested-loop
-//! joins, filter, projection, sort, and limit. Later layers are specified
-//! in `docs/adr/`.
+//! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, `DELETE`, `VACUUM`, and
+//! `EXPLAIN` text into an AST. The executor evaluates expressions, including
+//! `WHERE`, and runs those statements. A primary key is an `INTEGER` column
+//! indexed by a B+Tree. The planner uses that index for an equality, a
+//! range, or a nested-loop join on the key, and for `ORDER BY` of the key
+//! ascending. `EXPLAIN` prints the operator tree. `EXPLAIN ANALYZE` runs a
+//! `SELECT` and reports each operator's row count and the pages read.
+//! Design notes are in `docs/adr/`.
 
 pub mod btree;
 pub mod buffer;

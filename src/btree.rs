@@ -373,6 +373,137 @@ impl BTree {
         }
         Err(invalid_index_page(page_id))
     }
+
+    /// Positions a cursor at the first leaf entry that satisfies `lower`.
+    ///
+    /// Reads internal nodes and that first leaf. [`IndexCursor::next`] reads
+    /// each later leaf only after the current one is exhausted, and stops
+    /// once a key is past `upper`.
+    pub(crate) fn seek(
+        &self,
+        pages: &mut BufferPool,
+        lower: Option<KeyBound>,
+        upper: Option<KeyBound>,
+    ) -> io::Result<IndexCursor> {
+        let mut cursor = IndexCursor {
+            leaf: PageId(0),
+            next_leaf: PageId(0),
+            index: 0,
+            entries: Vec::new(),
+            lower,
+            upper,
+            leaves_read: 0,
+            done: false,
+        };
+        let leaf = match lower {
+            None => self.leftmost_leaf(pages)?,
+            // (key, 0, 0) is before every real record id for `key`.
+            // (key, MAX, MAX) is after every real record id for `key`, so an
+            // exclusive lower bound starts at the next key.
+            Some(bound) if bound.inclusive => self.find_leaf_page(pages, bound.value, 0, 0)?,
+            Some(bound) => self.find_leaf_page(pages, bound.value, u32::MAX, u16::MAX)?,
+        };
+        cursor.load(self, pages, leaf)?;
+        cursor.index = cursor
+            .entries
+            .iter()
+            .position(|(key, _)| lower_ok(*key, cursor.lower))
+            .unwrap_or(cursor.entries.len());
+        Ok(cursor)
+    }
+}
+
+/// Inclusive or exclusive end of a primary-key range.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct KeyBound {
+    /// Bound value.
+    pub value: i64,
+    /// `true` for `>=` or `<=`, `false` for `>` or `<`.
+    pub inclusive: bool,
+}
+
+/// Walks leaf entries from a [`BTree::seek`] position.
+pub(crate) struct IndexCursor {
+    leaf: PageId,
+    next_leaf: PageId,
+    index: usize,
+    entries: Vec<(i64, RecordId)>,
+    lower: Option<KeyBound>,
+    upper: Option<KeyBound>,
+    leaves_read: usize,
+    done: bool,
+}
+
+impl IndexCursor {
+    /// The next `(key, record id)` in leaf order, or `Ok(None)` past the end.
+    ///
+    /// A page that is not a leaf of this index is [`ErrorKind::InvalidData`]
+    /// (`invalid index page: {page_id}`).
+    pub(crate) fn next(
+        &mut self,
+        tree: &BTree,
+        pages: &mut BufferPool,
+    ) -> io::Result<Option<(i64, RecordId)>> {
+        if self.done {
+            return Ok(None);
+        }
+        let limit = pages.page_count()? as usize;
+        loop {
+            while self.index < self.entries.len() {
+                let (key, rid) = self.entries[self.index];
+                self.index += 1;
+                if !lower_ok(key, self.lower) {
+                    continue;
+                }
+                if upper_past(key, self.upper) {
+                    self.done = true;
+                    return Ok(None);
+                }
+                return Ok(Some((key, rid)));
+            }
+            if self.next_leaf == PageId(0) {
+                self.done = true;
+                return Ok(None);
+            }
+            if self.leaves_read >= limit {
+                return Err(invalid_index_page(self.next_leaf));
+            }
+            self.load(tree, pages, self.next_leaf)?;
+        }
+    }
+
+    fn load(&mut self, tree: &BTree, pages: &mut BufferPool, page_id: PageId) -> io::Result<()> {
+        match read_node(pages, page_id, tree.owner)? {
+            Node::Leaf { next, entries } => {
+                self.leaf = page_id;
+                self.next_leaf = next;
+                self.entries = entries
+                    .into_iter()
+                    .map(|entry| (entry.key, entry.rid))
+                    .collect();
+                self.index = 0;
+                self.leaves_read += 1;
+                Ok(())
+            }
+            Node::Internal { .. } => Err(invalid_index_page(page_id)),
+        }
+    }
+}
+
+fn lower_ok(key: i64, lower: Option<KeyBound>) -> bool {
+    match lower {
+        None => true,
+        Some(bound) if bound.inclusive => key >= bound.value,
+        Some(bound) => key > bound.value,
+    }
+}
+
+fn upper_past(key: i64, upper: Option<KeyBound>) -> bool {
+    match upper {
+        None => false,
+        Some(bound) if bound.inclusive => key > bound.value,
+        Some(bound) => key >= bound.value,
+    }
 }
 
 /// Left takes `ceil(len / 2)` entries. The separator is the right leaf's first entry.
@@ -991,5 +1122,65 @@ mod tests {
         let err = tree.scan_all(&mut pages).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), format!("invalid index page: {zero}"));
+    }
+
+    #[test]
+    fn range_cursor_is_ordered_and_reads_later_leaves_lazily() {
+        let (_db, mut pages, root) = fresh("range");
+        let tree = BTree::with_capacities(root, OWNER, 2, 2);
+        for key in 1..=8 {
+            tree.insert(&mut pages, key, rid(1, key as u16)).unwrap();
+        }
+        tree.insert(&mut pages, 4, rid(2, 0)).unwrap();
+        let lower = super::KeyBound {
+            value: 3,
+            inclusive: true,
+        };
+        let upper = super::KeyBound {
+            value: 6,
+            inclusive: false,
+        };
+        let mut cursor = tree.seek(&mut pages, Some(lower), Some(upper)).unwrap();
+        let mut keys = Vec::new();
+        while let Some((key, id)) = cursor.next(&tree, &mut pages).unwrap() {
+            keys.push((key, id.page_id.0, id.slot_id));
+        }
+        assert_eq!(keys, vec![(3, 1, 3), (4, 1, 4), (4, 2, 0), (5, 1, 5)]);
+
+        let before = pages.stats().logical_reads;
+        let mut cursor = tree.seek(&mut pages, None, None).unwrap();
+        let first_reads = pages.stats().logical_reads - before;
+        assert_eq!(cursor.next(&tree, &mut pages).unwrap().unwrap().0, 1);
+        let after_one = pages.stats().logical_reads - before;
+        assert_eq!(after_one, first_reads, "yielding a row does not read ahead");
+        let mut rest = 0;
+        while cursor.next(&tree, &mut pages).unwrap().is_some() {
+            rest += 1;
+        }
+        let after_all = pages.stats().logical_reads - before;
+        assert_eq!(rest, 8);
+        assert!(
+            after_all > after_one,
+            "walking the rest read more leaves ({after_one} then {after_all})"
+        );
+
+        let mut exclusive = tree
+            .seek(
+                &mut pages,
+                Some(super::KeyBound {
+                    value: 5,
+                    inclusive: false,
+                }),
+                Some(super::KeyBound {
+                    value: 8,
+                    inclusive: true,
+                }),
+            )
+            .unwrap();
+        let mut tail = Vec::new();
+        while let Some((key, _)) = exclusive.next(&tree, &mut pages).unwrap() {
+            tail.push(key);
+        }
+        assert_eq!(tail, vec![6, 7, 8]);
     }
 }

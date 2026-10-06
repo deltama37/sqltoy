@@ -148,6 +148,8 @@ pub struct Database {
     /// Session whose statement or row call is running.
     exec_session: SessionId,
     next_session_id: u32,
+    /// When `false`, plans use sequential scans, nested loops, and a sort.
+    planner_enabled: bool,
 }
 
 struct Session {
@@ -224,11 +226,27 @@ impl Database {
             default_session,
             exec_session: default_session,
             next_session_id: 2,
+            planner_enabled: true,
         };
         if cleanup == 1 {
             database.crash_cleanup()?;
         }
         Ok(database)
+    }
+
+    /// Turns the rule-based planner on or off.
+    ///
+    /// The planner is on when a database is opened. Off, every binding is a
+    /// sequential scan, joins are nested loops, `WHERE` is one filter above
+    /// the joins, and `ORDER BY` is a sort. Index lookup is not used.
+    /// Results match the planner-on plans.
+    pub fn set_planner_enabled(&mut self, enabled: bool) {
+        self.planner_enabled = enabled;
+    }
+
+    /// Whether [`Self::set_planner_enabled`] last turned the planner on.
+    pub fn planner_enabled(&self) -> bool {
+        self.planner_enabled
     }
 
     /// The session used by [`Self::execute`], [`Self::begin`], and the row methods.

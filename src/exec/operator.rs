@@ -2,15 +2,19 @@
 //!
 //! `SELECT` is scan, then joins, then filter, then project, then sort, then
 //! limit. Sort reads its whole input. Limit stops calling `next` once it has
-//! produced enough rows, so a sequential scan does not read another page.
+//! produced enough rows, so a sequential scan or index range does not read
+//! another page. An index nested-loop join looks up the right primary key
+//! for each left row instead of reading the right table.
 
+use std::cell::Cell;
 use std::cmp::Ordering;
 use std::io;
+use std::rc::Rc;
 
-use crate::btree::BTree;
+use crate::btree::{BTree, IndexCursor};
 use crate::catalog::{Database, TableSchema};
 use crate::page::PageId;
-use crate::record::RecordId;
+use crate::record::{RecordId, TableId};
 use crate::row::Value;
 use crate::sql::{Expr, JoinKind};
 
@@ -45,15 +49,36 @@ pub(crate) trait Operator {
 
 /// Builds the operator tree for `plan`.
 pub(crate) fn instantiate(plan: Plan) -> Box<dyn Operator> {
-    match plan {
+    let mut counts = Vec::new();
+    instantiate_counted(plan, &mut counts)
+}
+
+/// [`instantiate`] that records how many rows each operator yields.
+///
+/// `counts` is one cell per operator in the same preorder [`Plan::describe_with`]
+/// uses: the node, then its children.
+pub(crate) fn instantiate_counted(
+    plan: Plan,
+    counts: &mut Vec<Rc<Cell<u64>>>,
+) -> Box<dyn Operator> {
+    let rows = Rc::new(Cell::new(0));
+    counts.push(Rc::clone(&rows));
+    let inner: Box<dyn Operator> = match plan {
         Plan::SeqScan { schema, .. } => Box::new(SeqScan::new(schema)),
         Plan::IndexLookup { schema, key, .. } => Box::new(IndexLookup::new(schema, key)),
+        Plan::IndexScan {
+            schema,
+            lower,
+            upper,
+            empty,
+            ..
+        } => Box::new(IndexScan::new(schema, lower, upper, empty)),
         Plan::Filter {
             input,
             predicate,
             bindings,
         } => Box::new(Filter {
-            input: instantiate(*input),
+            input: instantiate_counted(*input, counts),
             predicate,
             bindings,
         }),
@@ -67,8 +92,8 @@ pub(crate) fn instantiate(plan: Plan) -> Box<dyn Operator> {
         } => Box::new(NestedLoopJoin {
             kind,
             on,
-            left: instantiate(*left),
-            right: instantiate(*right),
+            left: instantiate_counted(*left, counts),
+            right: instantiate_counted(*right, counts),
             bindings,
             right_columns,
             right_rows: None,
@@ -76,12 +101,32 @@ pub(crate) fn instantiate(plan: Plan) -> Box<dyn Operator> {
             right_index: 0,
             matched: false,
         }),
+        Plan::IndexNestedLoopJoin {
+            kind,
+            on,
+            left,
+            bindings,
+            right_columns,
+            right_schema,
+            key_expr,
+            ..
+        } => Box::new(IndexNestedLoopJoin {
+            kind,
+            on,
+            left: instantiate_counted(*left, counts),
+            bindings,
+            right_columns,
+            right_schema,
+            key_expr,
+            pending: Vec::new(),
+            pending_index: 0,
+        }),
         Plan::Project {
             input,
             exprs,
             bindings,
         } => Box::new(Project {
-            input: instantiate(*input),
+            input: instantiate_counted(*input, counts),
             exprs,
             bindings,
         }),
@@ -90,7 +135,7 @@ pub(crate) fn instantiate(plan: Plan) -> Box<dyn Operator> {
             keys,
             bindings,
         } => Box::new(Sort {
-            input: instantiate(*input),
+            input: instantiate_counted(*input, counts),
             keys,
             bindings,
             pending: Vec::new(),
@@ -102,12 +147,28 @@ pub(crate) fn instantiate(plan: Plan) -> Box<dyn Operator> {
             limit,
             offset,
         } => Box::new(Limit {
-            input: instantiate(*input),
+            input: instantiate_counted(*input, counts),
             limit,
             offset,
             skipped: 0,
             emitted: 0,
         }),
+    };
+    Box::new(Counted { inner, rows })
+}
+
+struct Counted {
+    inner: Box<dyn Operator>,
+    rows: Rc<Cell<u64>>,
+}
+
+impl Operator for Counted {
+    fn next(&mut self, db: &mut Database) -> io::Result<Option<Tuple>> {
+        let row = self.inner.next(db)?;
+        if row.is_some() {
+            self.rows.set(self.rows.get() + 1);
+        }
+        Ok(row)
     }
 }
 
@@ -212,6 +273,72 @@ impl Operator for IndexLookup {
     }
 }
 
+struct IndexScan {
+    schema: TableSchema,
+    lower: Option<crate::btree::KeyBound>,
+    upper: Option<crate::btree::KeyBound>,
+    empty: bool,
+    cursor: Option<IndexCursor>,
+    root: PageId,
+    owner: TableId,
+    done: bool,
+}
+
+impl IndexScan {
+    fn new(
+        schema: TableSchema,
+        lower: Option<crate::btree::KeyBound>,
+        upper: Option<crate::btree::KeyBound>,
+        empty: bool,
+    ) -> IndexScan {
+        let root = schema.index_root.unwrap_or(PageId(0));
+        let owner = schema.id;
+        IndexScan {
+            schema,
+            lower,
+            upper,
+            empty,
+            cursor: None,
+            root,
+            owner,
+            done: false,
+        }
+    }
+}
+
+impl Operator for IndexScan {
+    fn next(&mut self, db: &mut Database) -> io::Result<Option<Tuple>> {
+        if self.empty || self.done {
+            return Ok(None);
+        }
+        if self.cursor.is_none() {
+            if self.schema.index_root.is_none() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "missing index root",
+                ));
+            }
+            let tree = BTree::open(self.root, self.owner);
+            self.cursor = Some(tree.seek(db.records.pages_mut(), self.lower, self.upper)?);
+        }
+        loop {
+            let next_id = {
+                let tree = BTree::open(self.root, self.owner);
+                let cursor = self.cursor.as_mut().expect("cursor");
+                cursor.next(&tree, db.records.pages_mut())?
+            };
+            let Some((_key, id)) = next_id else {
+                self.done = true;
+                return Ok(None);
+            };
+            let bytes = db.records.get(self.schema.id, id)?;
+            if let Some(values) = db.visible_values(&self.schema, id, &bytes)? {
+                return Ok(Some(one_binding(values, Some(id))));
+            }
+        }
+    }
+}
+
 struct Filter {
     input: Box<dyn Operator>,
     predicate: Expr,
@@ -306,6 +433,76 @@ impl Operator for NestedLoopJoin {
 impl NestedLoopJoin {
     fn null_right(&self) -> Tuple {
         one_binding(vec![Value::Null; self.right_columns], None)
+    }
+}
+
+struct IndexNestedLoopJoin {
+    kind: JoinKind,
+    on: Expr,
+    left: Box<dyn Operator>,
+    bindings: Vec<OwnedBinding>,
+    right_columns: usize,
+    right_schema: TableSchema,
+    key_expr: Expr,
+    pending: Vec<Tuple>,
+    pending_index: usize,
+}
+
+impl Operator for IndexNestedLoopJoin {
+    fn next(&mut self, db: &mut Database) -> io::Result<Option<Tuple>> {
+        if self.pending_index < self.pending.len() {
+            let row = self.pending[self.pending_index].clone();
+            self.pending_index += 1;
+            return Ok(Some(row));
+        }
+        loop {
+            let Some(left) = self.left.next(db)? else {
+                return Ok(None);
+            };
+            let matched = self.matches_for(db, &left)?;
+            if matched.is_empty() {
+                if self.kind == JoinKind::Left {
+                    return Ok(Some(combine(&left, &self.null_right())));
+                }
+                continue;
+            }
+            self.pending = matched;
+            self.pending_index = 1;
+            return Ok(Some(self.pending[0].clone()));
+        }
+    }
+}
+
+impl IndexNestedLoopJoin {
+    fn null_right(&self) -> Tuple {
+        one_binding(vec![Value::Null; self.right_columns], None)
+    }
+
+    fn matches_for(&self, db: &mut Database, left: &Tuple) -> io::Result<Vec<Tuple>> {
+        let left_len = self.bindings.len() - 1;
+        let key = eval_on(&self.bindings[..left_len], left, &self.key_expr)?;
+        let Value::Integer(key) = key else {
+            return Ok(Vec::new());
+        };
+        let root = self
+            .right_schema
+            .index_root
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "missing index root"))?;
+        let tree = BTree::open(root, self.right_schema.id);
+        let ids = tree.lookup(db.records.pages_mut(), key)?;
+        let mut matched = Vec::new();
+        for id in ids {
+            let bytes = db.records.get(self.right_schema.id, id)?;
+            let Some(values) = db.visible_values(&self.right_schema, id, &bytes)? else {
+                continue;
+            };
+            let right = one_binding(values, Some(id));
+            let combined = combine(left, &right);
+            if predicate_true(&self.on, &self.bindings, &combined, "ON")? {
+                matched.push(combined);
+            }
+        }
+        Ok(matched)
     }
 }
 
@@ -748,10 +945,12 @@ mod tests {
                 SortKey::Output {
                     index: 0,
                     descending: false,
+                    label: "k".to_string(),
                 },
                 SortKey::Output {
                     index: 1,
                     descending: true,
+                    label: "t".to_string(),
                 },
             ],
             bindings: Vec::new(),
@@ -911,10 +1110,11 @@ mod tests {
             _ => panic!("select"),
         };
         let compiled = compile_select(&database, &select).unwrap();
-        assert!(compiled
-            .plan
-            .describe()
-            .starts_with("Project\n  SeqScan wide"));
+        let described = compiled.plan.describe();
+        assert!(
+            described.starts_with("Project id\n  SeqScan wide"),
+            "{described}"
+        );
         let before = database.pages_read();
         let mut op = instantiate(compiled.plan);
         let first = op.next(&mut database).unwrap().unwrap();
@@ -942,7 +1142,10 @@ mod tests {
         };
         let compiled = compile_select(&database, &select).unwrap();
         let described = compiled.plan.describe();
-        assert!(described.contains("IndexLookup users key=2"), "{described}");
+        assert!(
+            described.contains("IndexLookup users (id = 2)"),
+            "{described}"
+        );
         let mut op = instantiate(compiled.plan);
         let row = op.next(&mut database).unwrap().unwrap();
         assert_eq!(row.projected, vec![Value::Text("Bea".to_string())]);
@@ -977,6 +1180,7 @@ mod tests {
                                 table: "b".to_string(),
                                 binding: "bb".to_string(),
                                 schema: empty_schema(),
+                                pk: "id".to_string(),
                                 key: 5,
                             }),
                         }),
@@ -985,13 +1189,13 @@ mod tests {
             }),
         };
         let text = plan.describe();
-        assert!(text.contains("Limit limit=1 offset=2"), "{text}");
+        assert!(text.contains("Limit 1 OFFSET 2"), "{text}");
         assert!(text.contains("Sort"), "{text}");
         assert!(text.contains("Project"), "{text}");
-        assert!(text.contains("Filter"), "{text}");
+        assert!(text.contains("Filter TRUE"), "{text}");
         assert!(text.contains("NestedLoopJoin left"), "{text}");
         assert!(text.contains("SeqScan a"), "{text}");
-        assert!(text.contains("IndexLookup b AS bb key=5"), "{text}");
+        assert!(text.contains("IndexLookup b AS bb (id = 5)"), "{text}");
     }
 
     fn empty_schema() -> crate::catalog::TableSchema {

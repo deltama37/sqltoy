@@ -14,7 +14,7 @@ use crate::row::Value;
 use crate::sql::{Assignment, CreateTable, Delete, Expr, Insert, Select, Statement, Update};
 
 use super::eval::{bind_expr, column_not_found, eval, invalid, Binding, RowContext};
-use super::operator::instantiate;
+use super::operator::{instantiate, instantiate_counted};
 use super::plan::{compile_modify, compile_select};
 
 /// The outcome of one SQL statement.
@@ -56,9 +56,12 @@ impl Database {
     /// reference there is `column not found`.
     ///
     /// `SELECT` pulls from a scan, then joins, filter, project, sort, and
-    /// limit. `ORDER BY` is stable. `LIMIT` stops the scan once it has
-    /// enough rows. `UPDATE` and `DELETE` use the same scan and filter to
-    /// choose rows.
+    /// limit. The planner may replace a scan with a primary-key lookup or
+    /// range and a join with an index nested loop. `ORDER BY` is stable.
+    /// `LIMIT` stops the scan once it has enough rows. `UPDATE` and `DELETE`
+    /// use the same scan and filter to choose rows. `EXPLAIN` prints the
+    /// plan and does not run it. `EXPLAIN ANALYZE` runs a `SELECT` and adds
+    /// row counts and pages read.
     ///
     /// An unknown table is [`ErrorKind::NotFound`] (`table not found: {name}`).
     /// A bad column, value, or expression is [`ErrorKind::InvalidInput`].
@@ -105,6 +108,20 @@ impl Database {
                 self.rollback_on(session)?;
                 Ok(QueryResult::Rollback)
             }
+            Statement::Explain { analyze, statement } => {
+                if *analyze {
+                    let Statement::Select(select) = statement.as_ref() else {
+                        return Err(io::Error::new(
+                            ErrorKind::InvalidInput,
+                            "EXPLAIN ANALYZE supports only SELECT",
+                        ));
+                    };
+                    let select = select.clone();
+                    self.in_statement(move |db| db.execute_explain_analyze(&select))
+                } else {
+                    self.execute_explain(statement)
+                }
+            }
             statement => self.in_statement(|db| db.execute_plan(statement)),
         }
     }
@@ -120,6 +137,10 @@ impl Database {
             Statement::Begin | Statement::Commit | Statement::Rollback => Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "transaction control is not a planned statement",
+            )),
+            Statement::Explain { .. } => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "EXPLAIN is not a planned statement",
             )),
         }
     }
@@ -275,6 +296,44 @@ impl Database {
         })
     }
 
+    fn execute_explain(&self, statement: &Statement) -> io::Result<QueryResult> {
+        let plan = match statement {
+            Statement::Select(select) => compile_select(self, select)?.plan,
+            Statement::Update(update) => {
+                let schema = require_table(self, &update.table)?;
+                let _targets = assignment_targets(&schema, &update.assignments)?;
+                for assignment in &update.assignments {
+                    bind_expr(&schema.name, &schema.columns, &assignment.value)?;
+                }
+                compile_modify(&schema, update.filter.as_ref(), self.planner_enabled())?
+            }
+            Statement::Delete(delete) => {
+                let schema = require_table(self, &delete.table)?;
+                compile_modify(&schema, delete.filter.as_ref(), self.planner_enabled())?
+            }
+            _ => {
+                return Err(io::Error::new(
+                    ErrorKind::InvalidInput,
+                    "EXPLAIN supports only SELECT, UPDATE, or DELETE",
+                ));
+            }
+        };
+        Ok(plan_rows(&plan.describe()))
+    }
+
+    fn execute_explain_analyze(&mut self, select: &Select) -> io::Result<QueryResult> {
+        let compiled = compile_select(self, select)?;
+        let before = self.pages_read();
+        let mut counts = Vec::new();
+        let mut operator = instantiate_counted(compiled.plan.clone(), &mut counts);
+        while operator.next(self)?.is_some() {}
+        let pages = self.pages_read() - before;
+        let recorded: Vec<u64> = counts.iter().map(|cell| cell.get()).collect();
+        let mut text = compiled.plan.describe_with(Some(&recorded));
+        text.push_str(&format!("\nPages read: {pages}"));
+        Ok(plan_rows(&text))
+    }
+
     /// Operator tree for a `SELECT`, one line per operator.
     ///
     /// `EXPLAIN` will print this. The tree is the same one [`Self::execute_statement`]
@@ -288,7 +347,7 @@ impl Database {
         schema: &TableSchema,
         filter: Option<&Expr>,
     ) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
-        let plan = compile_modify(schema, filter)?;
+        let plan = compile_modify(schema, filter, self.planner_enabled())?;
         let mut operator = instantiate(plan);
         let mut rows = Vec::new();
         while let Some(tuple) = operator.next(self)? {
@@ -297,6 +356,16 @@ impl Database {
             rows.push((id, slot.values.clone()));
         }
         Ok(rows)
+    }
+}
+
+fn plan_rows(text: &str) -> QueryResult {
+    QueryResult::Rows {
+        columns: vec!["QUERY PLAN".to_string()],
+        rows: text
+            .lines()
+            .map(|line| vec![Value::Text(line.to_string())])
+            .collect(),
     }
 }
 
@@ -1496,7 +1565,7 @@ mod tests {
             &database,
             "SELECT a.n, b.n FROM a INNER JOIN b ON a.id = b.a_id WHERE a.id = 1",
         );
-        assert!(indexed.contains("IndexLookup a key=1"), "{indexed}");
+        assert!(indexed.contains("IndexLookup a (id = 1)"), "{indexed}");
         assert!(indexed.contains("SeqScan b"), "{indexed}");
 
         let note = "n".repeat(3000);
