@@ -5,14 +5,17 @@
 //! The record layer stores variable-length records in slotted pages and
 //! addresses them by record id. The catalog layer records table schemas in
 //! the file and restores them when the database is opened. The table layer
-//! stores typed rows in those tables, including NULL. Later layers (SQL and
-//! so on) are specified in `docs/adr/`.
+//! stores typed rows in those tables, including NULL. The SQL parser turns
+//! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` text into an
+//! AST. The executor is not implemented yet. Later layers are specified in
+//! `docs/adr/`.
 
 pub mod catalog;
 pub mod page;
 pub mod record;
 pub mod row;
 pub mod slotted_page;
+pub mod sql;
 pub mod storage;
 pub mod table;
 
