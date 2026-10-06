@@ -56,9 +56,11 @@ pub(crate) enum Keyword {
     Integer,
     Into,
     Is,
+    Key,
     Not,
     Null,
     Or,
+    Primary,
     Select,
     Set,
     Table,
@@ -82,9 +84,11 @@ impl Keyword {
             Keyword::Integer => "INTEGER",
             Keyword::Into => "INTO",
             Keyword::Is => "IS",
+            Keyword::Key => "KEY",
             Keyword::Not => "NOT",
             Keyword::Null => "NULL",
             Keyword::Or => "OR",
+            Keyword::Primary => "PRIMARY",
             Keyword::Select => "SELECT",
             Keyword::Set => "SET",
             Keyword::Table => "TABLE",
@@ -108,9 +112,11 @@ impl Keyword {
             "integer" => Keyword::Integer,
             "into" => Keyword::Into,
             "is" => Keyword::Is,
+            "key" => Keyword::Key,
             "not" => Keyword::Not,
             "null" => Keyword::Null,
             "or" => Keyword::Or,
+            "primary" => Keyword::Primary,
             "select" => Keyword::Select,
             "set" => Keyword::Set,
             "table" => Keyword::Table,
@@ -524,10 +530,10 @@ mod tests {
 
     #[test]
     fn keywords_are_case_insensitive_and_maximal() {
-        let words = "AND AS CREATE DELETE FALSE FROM INSERT INTEGER INTO IS NOT NULL OR SELECT SET TABLE TEXT TRUE UPDATE VALUES WHERE";
+        let words = "AND AS CREATE DELETE FALSE FROM INSERT INTEGER INTO IS KEY NOT NULL OR PRIMARY SELECT SET TABLE TEXT TRUE UPDATE VALUES WHERE";
         for sql in [words, &words.to_ascii_lowercase()] {
             let tokens = tokenize(sql).unwrap();
-            assert_eq!(tokens.len(), 22);
+            assert_eq!(tokens.len(), 24);
             for token in &tokens[..tokens.len() - 1] {
                 assert!(matches!(token.kind, TokenKind::Keyword(_)), "{token:?}");
             }

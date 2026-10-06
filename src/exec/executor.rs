@@ -7,10 +7,13 @@
 
 use std::io::{self, ErrorKind};
 
-use crate::catalog::{ColumnType, Database, TableSchema};
-use crate::row::{encode_row, Value};
+use crate::btree::BTree;
+use crate::catalog::{ColumnSpec, Database, TableSchema};
+use crate::record::RecordId;
+use crate::row::Value;
 use crate::sql::{
-    Assignment, ColumnRef, CreateTable, Delete, Expr, Insert, Select, SelectItem, Statement, Update,
+    Assignment, BinaryOp, ColumnRef, CreateTable, Delete, Expr, Insert, Select, SelectItem,
+    Statement, Update,
 };
 
 use super::eval::{bind_expr, column_not_found, eval, invalid, resolve_column, RowContext};
@@ -71,10 +74,14 @@ impl Database {
     }
 
     fn execute_create(&mut self, statement: &CreateTable) -> io::Result<QueryResult> {
-        let columns: Vec<(&str, ColumnType)> = statement
+        let columns: Vec<ColumnSpec> = statement
             .columns
             .iter()
-            .map(|column| (column.name.as_str(), column.column_type))
+            .map(|column| ColumnSpec {
+                name: column.name.as_str(),
+                column_type: column.column_type,
+                primary_key: column.primary_key,
+            })
             .collect();
         self.create_table(&statement.name, &columns)?;
         Ok(QueryResult::CreatedTable)
@@ -110,13 +117,10 @@ impl Database {
                 evaluated.push(eval(expr, &ctx)?);
             }
             let values = align_values(schema.columns.len(), targets.as_deref(), evaluated);
-            encode_row(&schema, &values)?;
             pending.push(values);
         }
-        for values in &pending {
-            self.insert(&schema.name, values)?;
-        }
-        Ok(QueryResult::Inserted(pending.len() as u64))
+        let inserted = self.insert_all(&schema.name, &pending)?;
+        Ok(QueryResult::Inserted(inserted.len() as u64))
     }
 
     fn execute_update(&mut self, update: &Update) -> io::Result<QueryResult> {
@@ -128,7 +132,7 @@ impl Database {
         if let Some(filter) = &update.filter {
             bind_expr(&schema.name, &schema.columns, filter)?;
         }
-        let scanned = self.scan(&schema.name)?;
+        let scanned = candidate_rows(self, &schema, update.filter.as_ref())?;
         let mut pending = Vec::new();
         for (id, old) in &scanned {
             let ctx = RowContext {
@@ -143,13 +147,10 @@ impl Database {
             for (index, assignment) in targets.iter().zip(&update.assignments) {
                 new_values[*index] = eval(&assignment.value, &ctx)?;
             }
-            encode_row(&schema, &new_values)?;
             pending.push((*id, new_values));
         }
-        for (id, values) in &pending {
-            self.update(&schema.name, *id, values)?;
-        }
-        Ok(QueryResult::Updated(pending.len() as u64))
+        let updated = self.apply_update(&schema.name, &pending)?;
+        Ok(QueryResult::Updated(updated.len() as u64))
     }
 
     fn execute_delete(&mut self, delete: &Delete) -> io::Result<QueryResult> {
@@ -157,7 +158,7 @@ impl Database {
         if let Some(filter) = &delete.filter {
             bind_expr(&schema.name, &schema.columns, filter)?;
         }
-        let scanned = self.scan(&schema.name)?;
+        let scanned = candidate_rows(self, &schema, delete.filter.as_ref())?;
         let mut ids = Vec::new();
         for (id, values) in &scanned {
             let ctx = RowContext {
@@ -184,7 +185,7 @@ impl Database {
         if let Some(filter) = &select.filter {
             bind_expr(&schema.name, &schema.columns, filter)?;
         }
-        let scanned = self.scan(&schema.name)?;
+        let scanned = candidate_rows(self, &schema, select.filter.as_ref())?;
         let mut rows = Vec::new();
         for (_, values) in &scanned {
             let ctx = RowContext {
@@ -210,6 +211,119 @@ fn require_table(db: &Database, name: &str) -> io::Result<TableSchema> {
     db.table(name)
         .cloned()
         .ok_or_else(|| io::Error::new(ErrorKind::NotFound, format!("table not found: {name}")))
+}
+
+fn candidate_rows(
+    db: &mut Database,
+    schema: &TableSchema,
+    filter: Option<&Expr>,
+) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
+    if let Some(filter) = filter {
+        if let Some(key) = index_lookup_key(schema, filter) {
+            return lookup_primary_key(db, schema, key);
+        }
+    }
+    db.scan(&schema.name)
+}
+
+/// Integer from a top-level `pk = const` or `const = pk` conjunct.
+///
+/// `None` means the caller should scan. A constant that is not an integer,
+/// or that fails to evaluate, also returns `None` so the scan reports the
+/// same rows and errors.
+fn index_lookup_key(schema: &TableSchema, filter: &Expr) -> Option<i64> {
+    let pk_index = schema.primary_key?;
+    let pk_name = schema.columns[pk_index].name.as_str();
+    let const_expr = pk_equality_const(filter, &schema.name, pk_name)?;
+    let ctx = RowContext {
+        table: &schema.name,
+        columns: &schema.columns,
+        values: None,
+    };
+    match eval(const_expr, &ctx) {
+        Ok(Value::Integer(key)) => Some(key),
+        _ => None,
+    }
+}
+
+fn lookup_primary_key(
+    db: &mut Database,
+    schema: &TableSchema,
+    key: i64,
+) -> io::Result<Vec<(RecordId, Vec<Value>)>> {
+    let root = schema
+        .index_root
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing index root"))?;
+    let tree = BTree::open(root, schema.id);
+    let Some(id) = tree.get(db.records.pages_mut(), key)? else {
+        return Ok(Vec::new());
+    };
+    let values = db.get(&schema.name, id)?;
+    Ok(vec![(id, values)])
+}
+
+fn pk_equality_const<'a>(filter: &'a Expr, table: &str, pk_name: &str) -> Option<&'a Expr> {
+    for conjunct in and_conjuncts(filter) {
+        if let Some(expr) = eq_pk_const(conjunct, table, pk_name) {
+            return Some(expr);
+        }
+    }
+    None
+}
+
+fn and_conjuncts(expr: &Expr) -> Vec<&Expr> {
+    match expr {
+        Expr::Binary {
+            op: BinaryOp::And,
+            left,
+            right,
+        } => {
+            let mut parts = and_conjuncts(left);
+            parts.extend(and_conjuncts(right));
+            parts
+        }
+        other => vec![other],
+    }
+}
+
+fn eq_pk_const<'a>(expr: &'a Expr, table: &str, pk_name: &str) -> Option<&'a Expr> {
+    let Expr::Binary {
+        op: BinaryOp::Eq,
+        left,
+        right,
+    } = expr
+    else {
+        return None;
+    };
+    if is_pk_ref(left, table, pk_name) && !contains_column(right) {
+        Some(right)
+    } else if is_pk_ref(right, table, pk_name) && !contains_column(left) {
+        Some(left)
+    } else {
+        None
+    }
+}
+
+fn is_pk_ref(expr: &Expr, table: &str, pk_name: &str) -> bool {
+    let Expr::Column(reference) = expr else {
+        return false;
+    };
+    if let Some(qualifier) = &reference.table {
+        if !qualifier.eq_ignore_ascii_case(table) {
+            return false;
+        }
+    }
+    reference.column.eq_ignore_ascii_case(pk_name)
+}
+
+fn contains_column(expr: &Expr) -> bool {
+    match expr {
+        Expr::Literal(_) => false,
+        Expr::Column(_) => true,
+        Expr::Unary { expr, .. } => contains_column(expr),
+        Expr::Binary { left, right, .. } => contains_column(left) || contains_column(right),
+        Expr::IsNull { expr, .. } => contains_column(expr),
+    }
 }
 
 fn matches_where(filter: Option<&Expr>, ctx: &RowContext<'_>) -> io::Result<bool> {
@@ -779,5 +893,264 @@ mod tests {
         );
         let (_, rows) = query(&mut database, "SELECT * FROM t WHERE TRUE OR NULL");
         assert_eq!(rows, vec![vec![int(1)], vec![int(2)]]);
+    }
+
+    #[test]
+    fn indexed_queries_match_a_table_without_a_primary_key() {
+        let (_db, mut database) = open("cmp");
+        exec(
+            &mut database,
+            "CREATE TABLE pked (id INTEGER PRIMARY KEY, name TEXT); \
+             CREATE TABLE plain (id INTEGER, name TEXT)",
+        );
+        let ids = [-20_i64, -1, 0, 1, 2, 5, 8, 9, 10, 11, 40, i64::MAX];
+        let values = ids
+            .iter()
+            .map(|id| format!("({id}, 'n{id}')"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        exec(
+            &mut database,
+            &format!("INSERT INTO pked VALUES {values}; INSERT INTO plain VALUES {values}"),
+        );
+        let queries = [
+            "SELECT * FROM {t} WHERE id = 5",
+            "SELECT * FROM {t} WHERE 5 = id",
+            "SELECT name FROM {t} WHERE {t}.id = 5",
+            "SELECT * FROM {t} WHERE id = 2 + 3",
+            "SELECT * FROM {t} WHERE id = - 1",
+            "SELECT * FROM {t} WHERE id = 5 AND name = 'n5'",
+            "SELECT * FROM {t} WHERE name = 'n5' AND id = 5",
+            "SELECT * FROM {t} WHERE id = 5 OR name = 'n1'",
+            "SELECT * FROM {t} WHERE id > 3 AND id < 11",
+            "SELECT * FROM {t} WHERE id = NULL",
+            "SELECT * FROM {t} WHERE id = 999",
+            "SELECT * FROM {t}",
+            "SELECT * FROM {t} WHERE id = 1 + 2 * 2",
+            "SELECT id FROM {t} WHERE name = 'n10' AND id = 10 AND 1 = 1",
+        ];
+        for sql in queries {
+            let pk_sql = sql.replace("{t}", "pked");
+            let plain_sql = sql.replace("{t}", "plain");
+            let (_, pk_rows) = query(&mut database, &pk_sql);
+            let (_, plain_rows) = query(&mut database, &plain_sql);
+            assert_eq!(pk_rows, plain_rows, "{pk_sql}");
+        }
+        for sql in [
+            "SELECT * FROM {t} WHERE id = 'x'",
+            "SELECT * FROM {t} WHERE id = TRUE",
+            "SELECT * FROM {t} WHERE id = 1 / 0",
+            "UPDATE {t} SET name = 'z' WHERE id = 'x'",
+            "DELETE FROM {t} WHERE id = TRUE",
+        ] {
+            let pk_err = exec_err(&mut database, &sql.replace("{t}", "pked"));
+            let plain_err = exec_err(&mut database, &sql.replace("{t}", "plain"));
+            assert_eq!(pk_err, plain_err, "{sql}");
+        }
+
+        exec(
+            &mut database,
+            "UPDATE pked SET name = 'z' WHERE id = 5; \
+             UPDATE plain SET name = 'z' WHERE id = 5; \
+             DELETE FROM pked WHERE id = 8; \
+             DELETE FROM plain WHERE id = 8",
+        );
+        let (_, pk_rows) = query(&mut database, "SELECT * FROM pked");
+        let (_, plain_rows) = query(&mut database, "SELECT * FROM plain");
+        assert_eq!(pk_rows, plain_rows);
+    }
+
+    #[test]
+    fn primary_key_insert_update_and_delete_rules() {
+        let db = TempDb::new("pkrules");
+        {
+            let mut database = Database::open(db.path()).unwrap();
+            exec(
+                &mut database,
+                "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+            );
+            assert_eq!(
+                exec_err(&mut database, "INSERT INTO users VALUES (1, 'a'), (1, 'b')"),
+                (
+                    ErrorKind::InvalidInput,
+                    "duplicate primary key: 1".to_string()
+                )
+            );
+            assert_eq!(
+                exec_err(&mut database, "INSERT INTO users VALUES (NULL, 'a')"),
+                (
+                    ErrorKind::InvalidInput,
+                    "NULL in primary key column: id".to_string()
+                )
+            );
+            assert_eq!(
+                exec_err(&mut database, "INSERT INTO users (name) VALUES ('a')"),
+                (
+                    ErrorKind::InvalidInput,
+                    "NULL in primary key column: id".to_string()
+                )
+            );
+            let (_, rows) = query(&mut database, "SELECT * FROM users");
+            assert!(rows.is_empty());
+
+            exec(&mut database, "INSERT INTO users VALUES (1, 'a')");
+            assert_eq!(
+                exec_err(&mut database, "INSERT INTO users VALUES (2, 'b'), (1, 'c')"),
+                (
+                    ErrorKind::InvalidInput,
+                    "duplicate primary key: 1".to_string()
+                )
+            );
+            let (_, rows) = query(&mut database, "SELECT * FROM users");
+            assert_eq!(rows, vec![vec![int(1), text("a")]]);
+
+            exec(
+                &mut database,
+                "INSERT INTO users VALUES (2, 'b'), (3, 'c'), (4, 'd')",
+            );
+            assert_eq!(
+                exec(&mut database, "UPDATE users SET id = id + 1"),
+                vec![QueryResult::Updated(4)]
+            );
+            let (_, rows) = query(&mut database, "SELECT id FROM users");
+            assert_eq!(
+                rows,
+                vec![vec![int(2)], vec![int(3)], vec![int(4)], vec![int(5)]]
+            );
+
+            assert_eq!(
+                exec_err(&mut database, "UPDATE users SET id = 2 WHERE id = 5"),
+                (
+                    ErrorKind::InvalidInput,
+                    "duplicate primary key: 2".to_string()
+                )
+            );
+            assert_eq!(
+                exec_err(&mut database, "UPDATE users SET id = 9"),
+                (
+                    ErrorKind::InvalidInput,
+                    "duplicate primary key: 9".to_string()
+                )
+            );
+            let (_, rows) = query(&mut database, "SELECT id, name FROM users");
+            assert_eq!(
+                rows,
+                vec![
+                    vec![int(2), text("a")],
+                    vec![int(3), text("b")],
+                    vec![int(4), text("c")],
+                    vec![int(5), text("d")],
+                ]
+            );
+
+            exec(
+                &mut database,
+                "CREATE TABLE notes (id INTEGER PRIMARY KEY, body TEXT)",
+            );
+            let wide = "n".repeat(2000);
+            exec(
+                &mut database,
+                &format!("INSERT INTO notes VALUES (1, '{wide}'), (2, '{wide}')"),
+            );
+            let before = database.scan("notes").unwrap()[0].0;
+            let grown = "g".repeat(2500);
+            exec(
+                &mut database,
+                &format!("UPDATE notes SET body = '{grown}' WHERE id = 1"),
+            );
+            let schema = database.table("notes").unwrap().clone();
+            let notes = crate::btree::BTree::open(schema.index_root.unwrap(), schema.id);
+            let indexed = notes.get(database.records.pages_mut(), 1).unwrap().unwrap();
+            assert_ne!(indexed, before);
+            assert_eq!(database.get("notes", indexed).unwrap()[1], text(&grown));
+            let (_, rows) = query(&mut database, "SELECT body FROM notes WHERE id = 1");
+            assert_eq!(rows, vec![vec![text(&grown)]]);
+
+            let schema = database.table("users").unwrap().clone();
+            let tree = crate::btree::BTree::open(schema.index_root.unwrap(), schema.id);
+            exec(&mut database, "DELETE FROM users WHERE id = 2");
+            assert!(tree.get(database.records.pages_mut(), 2).unwrap().is_none());
+            exec(&mut database, "INSERT INTO users VALUES (2, 'again')");
+            let (_, rows) = query(&mut database, "SELECT name FROM users WHERE id = 2");
+            assert_eq!(rows, vec![vec![text("again")]]);
+        }
+
+        let mut database = Database::open(db.path()).unwrap();
+        let (_, rows) = query(&mut database, "SELECT name FROM users WHERE users.id = 2");
+        assert_eq!(rows, vec![vec![text("again")]]);
+        assert!(database.index_height("users").unwrap().unwrap() >= 1);
+    }
+
+    #[test]
+    fn primary_key_lookup_reads_few_pages_on_a_wide_table() {
+        let (_db, mut database) = open("wide");
+        exec(
+            &mut database,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        let note = "n".repeat(3000);
+        for id in 1..=260 {
+            exec(
+                &mut database,
+                &format!("INSERT INTO users VALUES ({id}, '{note}')"),
+            );
+        }
+        let height = database.index_height("users").unwrap().unwrap();
+        assert!(height >= 2, "height {height}");
+
+        let before = database.pages_read();
+        let (_, rows) = query(&mut database, "SELECT id FROM users WHERE id = 123");
+        let lookup = database.pages_read() - before;
+        assert_eq!(rows, vec![vec![int(123)]]);
+        assert!(
+            lookup <= u64::from(height) + 2,
+            "lookup read {lookup} pages at height {height}"
+        );
+
+        let before = database.pages_read();
+        let (_, rows) = query(
+            &mut database,
+            "SELECT id FROM users WHERE users.id = 200 AND name = 'missing'",
+        );
+        let filtered = database.pages_read() - before;
+        assert!(rows.is_empty());
+        assert!(filtered <= u64::from(height) + 2);
+
+        let before = database.pages_read();
+        let _ = query(&mut database, "SELECT id FROM users");
+        let scan = database.pages_read() - before;
+        assert!(scan > 200, "scan read {scan}");
+        assert!(lookup * 20 < scan);
+
+        let before = database.pages_read();
+        let err = database.execute("SELECT * FROM users WHERE id = NULL");
+        assert!(err.is_ok());
+        let null_lookup = database.pages_read() - before;
+        assert!(
+            null_lookup > 200,
+            "NULL constant should scan, read {null_lookup}"
+        );
+
+        let before = database.pages_read();
+        let err = database
+            .execute("SELECT * FROM users WHERE id = 'x'")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        let text_lookup = database.pages_read() - before;
+        assert!(
+            text_lookup > 200,
+            "text constant should scan, read {text_lookup}"
+        );
+
+        let before = database.pages_read();
+        exec(&mut database, "DELETE FROM users WHERE id = 50");
+        let deleted = database.pages_read() - before;
+        assert!(
+            deleted < scan / 2,
+            "delete read {deleted}, scan read {scan}"
+        );
+        exec(&mut database, "INSERT INTO users VALUES (50, 'back')");
+        let (_, rows) = query(&mut database, "SELECT name FROM users WHERE id = 50");
+        assert_eq!(rows, vec![vec![text("back")]]);
     }
 }

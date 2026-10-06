@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqltoy::{ColumnType, Database, PageId, RecordId, Value};
+use sqltoy::{ColumnSpec, ColumnType, Database, PageId, RecordId, Value};
 
 #[test]
 fn rows_persist_after_reopen() {
@@ -17,9 +17,9 @@ fn rows_persist_after_reopen() {
         db.create_table(
             "users",
             &[
-                ("id", ColumnType::Integer),
-                ("name", ColumnType::Text),
-                ("age", ColumnType::Integer),
+                ColumnSpec::new("id", ColumnType::Integer),
+                ColumnSpec::new("name", ColumnType::Text),
+                ColumnSpec::new("age", ColumnType::Integer),
             ],
         )
         .expect("create");
@@ -94,12 +94,18 @@ fn rows_of_two_tables_do_not_mix() {
     let mut db = Database::open(&path).expect("open");
     db.create_table(
         "users",
-        &[("id", ColumnType::Integer), ("name", ColumnType::Text)],
+        &[
+            ColumnSpec::new("id", ColumnType::Integer),
+            ColumnSpec::new("name", ColumnType::Text),
+        ],
     )
     .expect("users");
     db.create_table(
         "posts",
-        &[("id", ColumnType::Integer), ("title", ColumnType::Text)],
+        &[
+            ColumnSpec::new("id", ColumnType::Integer),
+            ColumnSpec::new("title", ColumnType::Text),
+        ],
     )
     .expect("posts");
     let user_id = db
@@ -136,9 +142,9 @@ fn update_moves_when_the_row_does_not_fit() {
     db.create_table(
         "users",
         &[
-            ("id", ColumnType::Integer),
-            ("name", ColumnType::Text),
-            ("age", ColumnType::Integer),
+            ColumnSpec::new("id", ColumnType::Integer),
+            ColumnSpec::new("name", ColumnType::Text),
+            ColumnSpec::new("age", ColumnType::Integer),
         ],
     )
     .expect("create");
@@ -208,7 +214,10 @@ fn bad_input_and_unknown_table() {
     let mut db = Database::open(&path).expect("open");
     db.create_table(
         "users",
-        &[("id", ColumnType::Integer), ("name", ColumnType::Text)],
+        &[
+            ColumnSpec::new("id", ColumnType::Integer),
+            ColumnSpec::new("name", ColumnType::Text),
+        ],
     )
     .expect("create");
 

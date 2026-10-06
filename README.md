@@ -12,6 +12,7 @@ are in `docs/adr/`:
 - ADR-0006 fixes row encoding and table operations.
 - ADR-0007 fixes the SQL lexer, grammar, and AST.
 - ADR-0008 fixes SQL execution rules and the CLI.
+- ADR-0009 fixes the primary key and the B+Tree index page format.
 
 ## Status
 
@@ -23,14 +24,17 @@ step 3, per ADR-0004) stores variable-length records in slotted pages and
 addresses them with stable record ids. Each record page belongs to one table.
 The Catalog (ADR-0002 step 4, per ADR-0005) is done: table schemas are stored
 in the database file and restored when the file is opened. The header format
-version is 2. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
+version is 3. Table Operations (ADR-0002 step 5, per ADR-0006) are done:
 typed rows, including NULL, can be inserted, scanned, updated, and deleted.
 An update that no longer fits on its page is stored at a new record id. The
 SQL parser (ADR-0002 step 6, per ADR-0007) is done: `CREATE TABLE`, `INSERT`,
 `SELECT`, `UPDATE`, and `DELETE` parse into an AST, including `WHERE` and
 expressions. The executor (ADR-0002 step 7, per ADR-0008) is done: those
 statements run from the library and from `sqltoy sql` / `sqltoy repl`. This
-is the first SQL milestone.
+is the first SQL milestone. The primary-key index (ADR-0002 step 8, per
+ADR-0009) is done. An `INTEGER` column marked `PRIMARY KEY` is unique and
+not NULL, and `WHERE id = 1` reads that one row from a B+Tree instead of
+scanning the table.
 
 ## Build and test
 
@@ -56,6 +60,24 @@ INSERT 1
   1 | Alice 
 (1 row)
 ```
+
+A primary key is one `INTEGER` column. A second insert of the same key fails,
+and the earlier row stays:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-pk.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'Alice'); INSERT INTO users VALUES (1, 'Bob'); SELECT * FROM users WHERE id = 1"
+```
+
+```text
+CREATE TABLE
+INSERT 1
+error: duplicate primary key: 1
+```
+
+`Database::pages_read` counts pages read since the database was opened. A
+primary-key equality reads a handful of pages (the tree height, plus the
+row). A query without that equality reads every page. The counter is not
+exposed by the CLI.
 
 `repl` reads SQL from stdin. A statement runs when the buffer, ignoring
 trailing whitespace, ends with `;`. `.quit` or `.exit` ends the session when
@@ -164,9 +186,10 @@ cargo run --quiet -- table-list /tmp/catalog.db
 ```
 
 `table-create` checks the name and the `column:type` pairs, assigns the next
-user-table id, writes one catalog record, and syncs. `table-list` below is a
-new process; it prints the schemas loaded back from the file, in table-id
-order:
+user-table id, writes one catalog record, and syncs. Add `:pk` to make an
+`INTEGER` column the primary key (`id:INTEGER:pk`). `table-list` prints
+`PRIMARY KEY` after that column's type. `table-list` below is a new process;
+it prints the schemas loaded back from the file, in table-id order:
 
 ```text
 created table users (id 2)

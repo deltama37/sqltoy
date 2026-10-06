@@ -8,8 +8,11 @@
 //! stores typed rows in those tables, including NULL. The SQL parser turns
 //! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` text into an
 //! AST. The executor evaluates expressions, including `WHERE`, and runs those
-//! statements. Later layers are specified in `docs/adr/`.
+//! statements. A primary key is an `INTEGER` column indexed by a B+Tree, so
+//! `WHERE id = 1` can read one row without scanning the table. Later layers
+//! are specified in `docs/adr/`.
 
+pub mod btree;
 pub mod catalog;
 pub mod exec;
 pub mod page;
@@ -20,7 +23,8 @@ pub mod sql;
 pub mod storage;
 pub mod table;
 
-pub use catalog::{Column, ColumnType, Database, TableSchema};
+pub use btree::BTree;
+pub use catalog::{Column, ColumnSpec, ColumnType, Database, TableSchema};
 pub use exec::{format_result, QueryResult};
 pub use page::{Page, PageId, PageManager, PAGE_SIZE};
 pub use record::{RecordFile, RecordId, TableId, MAX_RECORD_SIZE};

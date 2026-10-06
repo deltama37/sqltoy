@@ -86,13 +86,25 @@ impl Parser {
         self.expect_keyword(Keyword::Table)?;
         let name = self.expect_ident()?;
         self.expect(TokenKind::LParen, "'('")?;
-        let columns = self.parse_list(|parser| {
-            let name = parser.expect_ident()?;
-            let column_type = parser.parse_type()?;
-            Ok(ColumnDef { name, column_type })
-        })?;
+        let columns = self.parse_list(|parser| parser.parse_column_def())?;
         self.expect(TokenKind::RParen, "')'")?;
         Ok(CreateTable { name, columns })
+    }
+
+    fn parse_column_def(&mut self) -> io::Result<ColumnDef> {
+        let name = self.expect_ident()?;
+        let column_type = self.parse_type()?;
+        let primary_key = if self.eat_keyword(Keyword::Primary) {
+            self.expect_keyword(Keyword::Key)?;
+            true
+        } else {
+            false
+        };
+        Ok(ColumnDef {
+            name,
+            column_type,
+            primary_key,
+        })
     }
 
     fn parse_type(&mut self) -> io::Result<ColumnType> {
@@ -597,10 +609,12 @@ mod tests {
                     ColumnDef {
                         name: "id".to_string(),
                         column_type: ColumnType::Integer,
+                        primary_key: false,
                     },
                     ColumnDef {
                         name: "name".to_string(),
                         column_type: ColumnType::Text,
+                        primary_key: false,
                     },
                 ],
             })
@@ -612,6 +626,7 @@ mod tests {
                 columns: vec![ColumnDef {
                     name: "Id".to_string(),
                     column_type: ColumnType::Integer,
+                    primary_key: false,
                 }],
             })
         );
@@ -1005,6 +1020,7 @@ DELETE FROM users";
 
         let corpus = [
             "CREATE TABLE users (id INTEGER, name TEXT)",
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
             "CREATE TABLE T (_id INTEGER)",
             "CrEaTe TaBlE Users (Id integer)",
             "INSERT INTO users VALUES (1, 'Alice')",

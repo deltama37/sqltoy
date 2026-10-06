@@ -3,8 +3,8 @@ use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
 use sqltoy::{
-    format_result, Column, ColumnType, Database, PageId, PageManager, RecordFile, RecordId,
-    Storage, TableId, Value, PAGE_SIZE,
+    format_result, Column, ColumnSpec, ColumnType, Database, PageId, PageManager, RecordFile,
+    RecordId, Storage, TableId, Value, PAGE_SIZE,
 };
 
 const USAGE: &str = "\
@@ -23,7 +23,7 @@ commands:
   sqltoy rec-update <db_path> <table_id> <record_id> <text>
   sqltoy rec-delete <db_path> <table_id> <record_id>
   sqltoy rec-scan <db_path> <table_id>
-  sqltoy table-create <db_path> <name> <column:type>...
+  sqltoy table-create <db_path> <name> <column:type[:pk]>...
   sqltoy table-list <db_path>
   sqltoy row-insert <db_path> <table> <value>...
   sqltoy row-scan <db_path> <table>
@@ -283,7 +283,14 @@ fn cmd_table_list(path: &str) -> io::Result<()> {
         let columns = table
             .columns
             .iter()
-            .map(|column| format!("{} {}", column.name, column.column_type))
+            .enumerate()
+            .map(|(index, column)| {
+                if table.primary_key == Some(index) {
+                    format!("{} {} PRIMARY KEY", column.name, column.column_type)
+                } else {
+                    format!("{} {}", column.name, column.column_type)
+                }
+            })
             .collect::<Vec<_>>()
             .join(", ");
         println!("{} {} ({columns})", table.id, table.name);
@@ -451,21 +458,37 @@ fn table_not_found(name: &str) -> io::Error {
     io::Error::new(io::ErrorKind::NotFound, format!("table not found: {name}"))
 }
 
-fn parse_column_def(raw: &str) -> io::Result<(&str, ColumnType)> {
+fn parse_column_def(raw: &str) -> io::Result<ColumnSpec<'_>> {
     let invalid = || {
         io::Error::new(
             io::ErrorKind::InvalidInput,
             format!("invalid column definition: {raw}"),
         )
     };
-    let Some((name, ty)) = raw.split_once(':') else {
+    let mut parts = raw.split(':');
+    let Some(name) = parts.next() else {
         return Err(invalid());
     };
-    if name.is_empty() || ty.is_empty() || ty.contains(':') {
+    let Some(ty) = parts.next() else {
+        return Err(invalid());
+    };
+    if name.is_empty() || ty.is_empty() {
+        return Err(invalid());
+    }
+    let primary_key = match parts.next() {
+        None => false,
+        Some(flag) if flag.eq_ignore_ascii_case("pk") => true,
+        Some(_) => return Err(invalid()),
+    };
+    if parts.next().is_some() {
         return Err(invalid());
     }
     let column_type = ty.parse()?;
-    Ok((name, column_type))
+    Ok(ColumnSpec {
+        name,
+        column_type,
+        primary_key,
+    })
 }
 
 fn parse_table_id(raw: &str) -> io::Result<TableId> {

@@ -4,7 +4,7 @@ use std::path::PathBuf;
 use std::process;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use sqltoy::{ColumnType, Database, RecordFile, TableId};
+use sqltoy::{ColumnSpec, ColumnType, Database, RecordFile, TableId};
 
 #[test]
 fn schemas_persist_after_reopen() {
@@ -16,12 +16,18 @@ fn schemas_persist_after_reopen() {
         let mut db = Database::open(&path).expect("open");
         db.create_table(
             "users",
-            &[("id", ColumnType::Integer), ("name", ColumnType::Text)],
+            &[
+                ColumnSpec::new("id", ColumnType::Integer),
+                ColumnSpec::new("name", ColumnType::Text),
+            ],
         )
         .expect("users");
         db.create_table(
             "posts",
-            &[("id", ColumnType::Integer), ("title", ColumnType::Text)],
+            &[
+                ColumnSpec::new("id", ColumnType::Integer),
+                ColumnSpec::new("title", ColumnType::Text),
+            ],
         )
         .expect("posts");
         created = db.tables().to_vec();
@@ -42,7 +48,7 @@ fn user_rows_are_not_catalog_entries() {
 
     {
         let mut db = Database::open(&path).expect("open");
-        db.create_table("users", &[("id", ColumnType::Integer)])
+        db.create_table("users", &[ColumnSpec::new("id", ColumnType::Integer)])
             .expect("create");
     }
     {

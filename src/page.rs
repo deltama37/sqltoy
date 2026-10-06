@@ -13,7 +13,7 @@ use crate::storage::Storage;
 pub const PAGE_SIZE: usize = 4096;
 
 const MAGIC: &[u8; 8] = b"SQLTOYDB";
-const FORMAT_VERSION: u32 = 2;
+const FORMAT_VERSION: u32 = 3;
 
 const MAGIC_OFFSET: usize = 0;
 const VERSION_OFFSET: usize = 8;
@@ -76,13 +76,14 @@ impl DerefMut for Page {
 /// Allocates, reads, and writes fixed-size pages in a database file.
 pub struct PageManager {
     storage: Storage,
+    pages_read: u64,
 }
 
 impl PageManager {
     /// Opens the database at `path`.
     ///
     /// An empty file is initialized with a header page and synced. An existing
-    /// file must carry the sqltoy magic, format version 2, and this build's
+    /// file must carry the sqltoy magic, format version 3, and this build's
     /// page size, and its length must be a positive multiple of [`PAGE_SIZE`].
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<PageManager> {
         let mut storage = Storage::open(path)?;
@@ -91,7 +92,18 @@ impl PageManager {
         } else {
             validate_existing(&mut storage)?;
         }
-        Ok(PageManager { storage })
+        Ok(PageManager {
+            storage,
+            pages_read: 0,
+        })
+    }
+
+    /// Successful [`Self::read_page`] calls since this manager was opened.
+    ///
+    /// A page id that is out of range does not count. The counter is not stored
+    /// in the file.
+    pub fn pages_read(&self) -> u64 {
+        self.pages_read
     }
 
     /// Number of pages in the file, including the header.
@@ -105,15 +117,25 @@ impl PageManager {
     /// The new page is synced before this returns. Page 0 is the header, so
     /// the first page allocated from a fresh database is id 1.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
+        let id = self.allocate_uncommitted()?;
+        self.storage.sync()?;
+        Ok(id)
+    }
+
+    /// Appends a zero-filled page without syncing.
+    ///
+    /// The caller must [`Self::sync`] before the new page is durable. Used by
+    /// the index, which syncs once per insert or delete.
+    pub(crate) fn allocate_uncommitted(&mut self) -> io::Result<PageId> {
         let id = PageId(self.page_count()?);
         self.storage.write_at(id.offset(), Page::zeroed().data())?;
-        self.storage.sync()?;
         Ok(id)
     }
 
     /// Reads the page identified by `id`.
     pub fn read_page(&mut self, id: PageId) -> io::Result<Page> {
         self.ensure_in_range(id)?;
+        self.pages_read += 1;
         let bytes = self.storage.read_at(id.offset(), PAGE_SIZE)?;
         let mut page = Page::zeroed();
         page.data_mut().copy_from_slice(&bytes);
@@ -249,11 +271,11 @@ mod tests {
         let mut pages = PageManager::open(db.path()).unwrap();
 
         assert_eq!(pages.page_count().unwrap(), 1);
-        assert_eq!(pages.format_version().unwrap(), 2);
+        assert_eq!(pages.format_version().unwrap(), 3);
 
         let header = pages.read_page(PageId(0)).unwrap();
         assert_eq!(&header.data()[..8], b"SQLTOYDB");
-        assert_eq!(&header.data()[8..12], &2u32.to_le_bytes());
+        assert_eq!(&header.data()[8..12], &3u32.to_le_bytes());
         assert_eq!(&header.data()[12..16], &(PAGE_SIZE as u32).to_le_bytes());
         assert!(header.data()[16..].iter().all(|byte| *byte == 0));
     }
@@ -328,8 +350,8 @@ mod tests {
             let mut storage = Storage::open(db.path()).unwrap();
             let mut bytes = vec![0u8; PAGE_SIZE];
             bytes[..8].copy_from_slice(b"SQLTOYDB");
-            // Not version 2. Page size is checked before the version.
-            bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+            // Not version 3. Page size is checked before the version.
+            bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
             bytes[12..16].copy_from_slice(&512u32.to_le_bytes());
             storage.write_at(0, &bytes).unwrap();
             storage.sync().unwrap();
@@ -347,7 +369,7 @@ mod tests {
             let mut storage = Storage::open(db.path()).unwrap();
             let mut bytes = vec![0u8; PAGE_SIZE];
             bytes[..8].copy_from_slice(b"SQLTOYDB");
-            bytes[8..12].copy_from_slice(&1u32.to_le_bytes());
+            bytes[8..12].copy_from_slice(&2u32.to_le_bytes());
             bytes[12..16].copy_from_slice(&(PAGE_SIZE as u32).to_le_bytes());
             storage.write_at(0, &bytes).unwrap();
             storage.sync().unwrap();
@@ -355,7 +377,21 @@ mod tests {
 
         let err = error_of(PageManager::open(db.path()));
         assert_eq!(err.kind(), ErrorKind::InvalidData);
-        assert_eq!(err.to_string(), "unsupported format version: 1");
+        assert_eq!(err.to_string(), "unsupported format version: 2");
+    }
+
+    #[test]
+    fn pages_read_counts_successful_reads() {
+        let db = TempDb::new("reads");
+        let mut pages = PageManager::open(db.path()).unwrap();
+        assert_eq!(pages.pages_read(), 0);
+        let id = pages.allocate_page().unwrap();
+        assert_eq!(pages.pages_read(), 0);
+        pages.read_page(id).unwrap();
+        pages.read_page(PageId(0)).unwrap();
+        assert_eq!(pages.pages_read(), 2);
+        assert!(pages.read_page(PageId(9)).is_err());
+        assert_eq!(pages.pages_read(), 2);
     }
 
     #[test]

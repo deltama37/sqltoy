@@ -236,6 +236,8 @@ mod tests {
             id: TableId(2),
             name: name.to_string(),
             columns,
+            primary_key: None,
+            index_root: None,
         }
     }
 
