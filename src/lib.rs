@@ -2,8 +2,10 @@
 //!
 //! The storage layer addresses one local file by byte offset. The page layer
 //! manages that file as fixed-size pages, with page 0 reserved as a header.
-//! The buffer pool caches those pages in a fixed number of frames and flushes
-//! dirty pages at the end of a SQL statement. The record layer stores
+//! The buffer pool caches those pages in frames and flushes dirty pages at
+//! commit. Dirty pages are not evicted. `BEGIN`, `COMMIT`, and `ROLLBACK`
+//! group statements; a statement outside a transaction commits itself, and a
+//! statement that fails is undone. The record layer stores
 //! variable-length records in slotted pages and addresses them by record id.
 //! The catalog layer records table schemas in
 //! the file and restores them when the database is opened. The table layer

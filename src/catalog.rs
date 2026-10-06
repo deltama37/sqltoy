@@ -116,14 +116,17 @@ pub struct TableSchema {
 
 /// An open database file and the schemas loaded from its catalog.
 ///
-/// Pages sit in a [`crate::buffer::BufferPool`]. [`Self::execute_statement`]
-/// and the public table methods flush it once when they return, including
-/// when the call fails. A flush failure after an error is discarded so the
-/// original error is what the caller sees. Helpers used inside one statement
-/// do not flush on their own, so a multi-row insert syncs once.
+/// Pages sit in a [`crate::buffer::BufferPool`]. Outside an explicit
+/// transaction, [`Self::execute_statement`] and the public table methods
+/// flush once when they succeed. A statement that fails is rolled back to
+/// the savepoint taken at its start, and the catalog is reloaded from pages.
+/// Inside [`Self::begin`], those methods leave dirty pages in memory until
+/// [`Self::commit`] or [`Self::rollback`]. Dropping a [`Database`] does not
+/// flush, so an open transaction is lost.
 pub struct Database {
     pub(crate) records: RecordFile,
     tables: Vec<TableSchema>,
+    in_transaction: bool,
 }
 
 impl Database {
@@ -143,25 +146,15 @@ impl Database {
     /// `frames` must be at least 1. The catalog rules match [`Self::open`].
     pub fn open_with_frames<P: AsRef<Path>>(path: P, frames: usize) -> io::Result<Database> {
         let mut records = RecordFile::open_pooled(path, frames)?;
-        let mut tables: Vec<TableSchema> = Vec::new();
-        for (rid, bytes) in records.scan(TableId::CATALOG)? {
-            let schema = decode_catalog_record(rid, &bytes)?;
-            if tables.iter().any(|table| table.id == schema.id) {
-                return Err(duplicate_table_id(schema.id));
-            }
-            if tables
-                .iter()
-                .any(|table| names_eq(&table.name, &schema.name))
-            {
-                return Err(duplicate_table_name(&schema.name));
-            }
-            tables.push(schema);
-        }
-        tables.sort_by_key(|table| table.id);
-        Ok(Database { records, tables })
+        let tables = load_tables(&mut records)?;
+        Ok(Database {
+            records,
+            tables,
+            in_transaction: false,
+        })
     }
 
-    /// Creates a user table and flushes its catalog record.
+    /// Creates a user table and, outside a transaction, flushes its catalog record.
     ///
     /// The assigned id is one greater than the highest user-table id already
     /// in the catalog, or [`TableId::FIRST_USER`] when there is none. `name`
@@ -176,15 +169,16 @@ impl Database {
     /// A primary key allocates an empty B+Tree leaf before the catalog record
     /// is written. Tables without a primary key have no index.
     ///
-    /// The buffer pool is flushed before this returns. A flush failure after
-    /// a failed call is discarded and the original error is returned.
+    /// Outside a transaction the buffer pool is flushed before this returns.
+    /// A failed call rolls the statement back. If the autocommit flush fails,
+    /// dirty frames are discarded and this returns the flush error; pages
+    /// that flush already wrote can remain on disk.
     pub fn create_table(
         &mut self,
         name: &str,
         columns: &[ColumnSpec<'_>],
     ) -> io::Result<&TableSchema> {
-        let created = self.create_table_unflushed(name, columns);
-        self.persist(created)?;
+        self.in_statement(|db| db.create_table_unflushed(name, columns))?;
         Ok(&self.tables[self.tables.len() - 1])
     }
 
@@ -275,15 +269,118 @@ impl Database {
         self.records.buffer_stats()
     }
 
-    /// Flushes the pool. On failure, keeps `result`'s error when it failed.
-    pub(crate) fn persist<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
-        match self.records.flush() {
-            Ok(()) => result,
-            Err(flush_err) => match result {
-                Err(original) => Err(original),
-                Ok(_) => Err(flush_err),
-            },
+    /// Starts an explicit transaction.
+    ///
+    /// A second call while one is open is [`ErrorKind::InvalidInput`]
+    /// (`transaction already in progress`).
+    pub fn begin(&mut self) -> io::Result<()> {
+        if self.in_transaction {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "transaction already in progress",
+            ));
         }
+        self.in_transaction = true;
+        Ok(())
+    }
+
+    /// Flushes dirty pages and ends the explicit transaction.
+    ///
+    /// No open transaction is [`ErrorKind::InvalidInput`]
+    /// (`no transaction in progress`). If flush fails, the transaction stays
+    /// open: pages already written are clean, and the rest stay dirty. Retry
+    /// [`Self::commit`] or call [`Self::rollback`].
+    pub fn commit(&mut self) -> io::Result<()> {
+        if !self.in_transaction {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "no transaction in progress",
+            ));
+        }
+        self.records.flush()?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    /// Drops every dirty page, reloads the catalog, and ends the transaction.
+    ///
+    /// No open transaction is [`ErrorKind::InvalidInput`]
+    /// (`no transaction in progress`).
+    pub fn rollback(&mut self) -> io::Result<()> {
+        if !self.in_transaction {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "no transaction in progress",
+            ));
+        }
+        self.records.discard_dirty()?;
+        self.reload_catalog()?;
+        self.in_transaction = false;
+        Ok(())
+    }
+
+    /// Whether [`Self::begin`] is in effect.
+    pub fn in_transaction(&self) -> bool {
+        self.in_transaction
+    }
+
+    /// Frames held by the buffer pool, including overflow past its capacity.
+    #[cfg(test)]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.records.frame_count()
+    }
+
+    /// Runs `body` as one atomic statement.
+    ///
+    /// On success the savepoint is released. Outside an explicit transaction
+    /// the pool is then flushed. On failure the savepoint is restored, the
+    /// catalog is reloaded, and `body`'s error is returned. Outside an
+    /// explicit transaction, dirty frames are also discarded.
+    ///
+    /// If the autocommit flush fails, remaining dirty frames are discarded,
+    /// the catalog is reloaded from whatever reached disk, and the flush
+    /// error is returned instead of `body`'s value. A flush writes pages in
+    /// id order, so a failure can leave a prefix of those pages on disk.
+    pub(crate) fn in_statement<T>(
+        &mut self,
+        body: impl FnOnce(&mut Self) -> io::Result<T>,
+    ) -> io::Result<T> {
+        self.records.set_savepoint()?;
+        let result = body(self);
+        self.finish_statement(result)
+    }
+
+    fn finish_statement<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        match result {
+            Ok(value) => {
+                self.records.release_savepoint()?;
+                if self.in_transaction {
+                    return Ok(value);
+                }
+                match self.records.flush() {
+                    Ok(()) => Ok(value),
+                    Err(flush_err) => {
+                        let _ = self.records.discard_dirty();
+                        let _ = self.reload_catalog();
+                        Err(flush_err)
+                    }
+                }
+            }
+            Err(original) => {
+                let _ = self.records.rollback_to_savepoint();
+                let _ = self.records.release_savepoint();
+                if !self.in_transaction {
+                    let _ = self.records.discard_dirty();
+                }
+                let _ = self.reload_catalog();
+                Err(original)
+            }
+        }
+    }
+
+    fn reload_catalog(&mut self) -> io::Result<()> {
+        self.tables = load_tables(&mut self.records)?;
+        Ok(())
     }
 
     /// Returns the schema named `name`, ignoring ASCII case.
@@ -298,6 +395,25 @@ impl Database {
     pub fn tables(&self) -> &[TableSchema] {
         &self.tables
     }
+}
+
+fn load_tables(records: &mut RecordFile) -> io::Result<Vec<TableSchema>> {
+    let mut tables: Vec<TableSchema> = Vec::new();
+    for (rid, bytes) in records.scan(TableId::CATALOG)? {
+        let schema = decode_catalog_record(rid, &bytes)?;
+        if tables.iter().any(|table| table.id == schema.id) {
+            return Err(duplicate_table_id(schema.id));
+        }
+        if tables
+            .iter()
+            .any(|table| names_eq(&table.name, &schema.name))
+        {
+            return Err(duplicate_table_name(&schema.name));
+        }
+        tables.push(schema);
+    }
+    tables.sort_by_key(|table| table.id);
+    Ok(tables)
 }
 
 fn encode_schema(schema: &TableSchema) -> io::Result<Vec<u8>> {

@@ -176,6 +176,79 @@ INSERT INTO t VALUES (7)";
 }
 
 #[test]
+fn repl_rollback_hides_the_insert() {
+    let path = unique_temp_path("repl-rollback");
+    let _cleanup = TempFile(path.clone());
+    let input = "\
+CREATE TABLE users (id INTEGER, name TEXT);
+BEGIN;
+INSERT INTO users VALUES (1, 'Alice');
+ROLLBACK;
+SELECT * FROM users;
+";
+    let output = run(&["repl", path.to_str().unwrap()], Some(input));
+    assert_eq!(output.status.code(), Some(0), "{}", utf8(&output.stderr));
+    assert_eq!(
+        utf8(&output.stdout),
+        "CREATE TABLE\nBEGIN\nINSERT 1\nROLLBACK\n id | name \n----+------\n(0 rows)\n"
+    );
+    assert_eq!(utf8(&output.stderr), "");
+}
+
+#[test]
+fn repl_eof_rolls_back_an_open_transaction() {
+    let path = unique_temp_path("repl-eof");
+    let _cleanup = TempFile(path.clone());
+    let input = "\
+CREATE TABLE users (id INTEGER, name TEXT);
+BEGIN;
+INSERT INTO users VALUES (1, 'Alice');
+";
+    let output = run(&["repl", path.to_str().unwrap()], Some(input));
+    assert_eq!(output.status.code(), Some(0), "{}", utf8(&output.stderr));
+    assert_eq!(utf8(&output.stdout), "CREATE TABLE\nBEGIN\nINSERT 1\n");
+    assert_eq!(utf8(&output.stderr), "warning: transaction rolled back\n");
+
+    let selected = run(
+        &["sql", path.to_str().unwrap(), "SELECT * FROM users"],
+        None,
+    );
+    assert_eq!(
+        selected.status.code(),
+        Some(0),
+        "{}",
+        utf8(&selected.stderr)
+    );
+    assert_eq!(
+        utf8(&selected.stdout),
+        " id | name \n----+------\n(0 rows)\n"
+    );
+}
+
+#[test]
+fn sql_command_rolls_back_when_begin_has_no_commit() {
+    let path = unique_temp_path("sql-rollback");
+    let _cleanup = TempFile(path.clone());
+    let sql =
+        "CREATE TABLE users (id INTEGER, name TEXT); BEGIN; INSERT INTO users VALUES (1, 'Alice')";
+    let output = run(&["sql", path.to_str().unwrap(), sql], None);
+    assert_eq!(output.status.code(), Some(0), "{}", utf8(&output.stderr));
+    assert_eq!(utf8(&output.stdout), "CREATE TABLE\nBEGIN\nINSERT 1\n");
+    assert_eq!(utf8(&output.stderr), "warning: transaction rolled back\n");
+
+    let selected = run(
+        &["sql", path.to_str().unwrap(), "SELECT * FROM users"],
+        None,
+    );
+    assert_eq!(selected.status.code(), Some(0));
+    assert_eq!(
+        utf8(&selected.stdout),
+        " id | name \n----+------\n(0 rows)\n"
+    );
+    assert_eq!(utf8(&selected.stderr), "");
+}
+
+#[test]
 fn sql_persists_across_processes() {
     let path = unique_temp_path("persist");
     let _cleanup = TempFile(path.clone());

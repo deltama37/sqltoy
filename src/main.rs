@@ -349,6 +349,12 @@ fn cmd_parse(sql: &str) -> io::Result<()> {
 
 fn cmd_sql(path: &str, sql: &str) -> io::Result<()> {
     let mut db = Database::open(path)?;
+    let result = run_sql(&mut db, sql);
+    rollback_if_open(&mut db)?;
+    result
+}
+
+fn run_sql(db: &mut Database, sql: &str) -> io::Result<()> {
     for statement in sqltoy::sql::parse(sql)? {
         let result = db.execute_statement(&statement)?;
         println!("{}", format_result(&result));
@@ -365,7 +371,11 @@ fn cmd_repl(path: &str) -> io::Result<()> {
     loop {
         if interactive {
             if buffer.trim().is_empty() {
-                print!("sqltoy> ");
+                if db.in_transaction() {
+                    print!("sqltoy*> ");
+                } else {
+                    print!("sqltoy> ");
+                }
             } else {
                 print!("   ...> ");
             }
@@ -394,6 +404,15 @@ fn cmd_repl(path: &str) -> io::Result<()> {
             run_buffer(&mut db, &buffer);
             buffer.clear();
         }
+    }
+    rollback_if_open(&mut db)?;
+    Ok(())
+}
+
+fn rollback_if_open(db: &mut Database) -> io::Result<()> {
+    if db.in_transaction() {
+        eprintln!("warning: transaction rolled back");
+        db.rollback()?;
     }
     Ok(())
 }

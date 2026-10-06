@@ -1,13 +1,19 @@
-//! Fixed-size page cache in front of [`crate::page::PageManager`].
+//! Page cache in front of [`crate::page::PageManager`].
 //!
 //! Callers read and write copies of a page. A hit copies the frame out. A
 //! miss reads the file. A write copies into a frame and marks it dirty, and
-//! does not read the old page when the frame is cold. Dirty frames are
-//! written on eviction without syncing. [`BufferPool::flush`] writes every
-//! dirty frame in page-id order and then syncs.
+//! does not read the old page when the frame is cold. Dirty frames are never
+//! evicted (no-steal): when every frame is dirty the pool grows past its
+//! configured capacity and shrinks back after [`BufferPool::flush`] or
+//! [`BufferPool::discard_dirty`]. [`BufferPool::flush`] writes every dirty
+//! frame in page-id order and then syncs.
 
+use std::collections::BTreeMap;
 use std::io::{self, ErrorKind};
 use std::path::Path;
+
+#[cfg(test)]
+use std::cell::Cell;
 
 use crate::page::{Page, PageId, PageManager};
 
@@ -23,10 +29,61 @@ pub struct BufferStats {
     pub hits: u64,
     /// Reads that loaded a page from disk.
     pub misses: u64,
-    /// Pages written to disk, including eviction and flush.
+    /// Pages written to disk, including flush.
     pub pages_written: u64,
-    /// Frames dropped to make room, dirty or clean.
+    /// Resident frames dropped to make room or to return to capacity.
     pub evictions: u64,
+    /// Peak frame count while the pool was above its configured capacity.
+    ///
+    /// Stays 0 until a dirty workload forces the pool to grow.
+    pub max_frames: u64,
+}
+
+/// Prior contents of one page, recorded the first time it is written after a
+/// savepoint.
+struct PageImage {
+    /// `None` when the page was not resident. It was clean on disk, and
+    /// rollback drops the frame so the next read loads the file.
+    bytes: Option<Page>,
+    dirty: bool,
+}
+
+struct Savepoint {
+    logical_pages: u32,
+    images: BTreeMap<u32, PageImage>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static WRITE_FAILPOINT: Cell<Option<u64>> = const { Cell::new(None) };
+}
+
+/// Allows `allow` later [`BufferPool::write_page`] calls, then returns an error.
+///
+/// Record storage and the B+Tree both write through that method, so the
+/// counter can fail a statement between two page updates. Zero fails the next
+/// write. The counter is per thread.
+#[cfg(test)]
+pub(crate) fn arm_write_failpoint(allow: u64) {
+    WRITE_FAILPOINT.with(|slot| slot.set(Some(allow)));
+}
+
+/// Disarms [`arm_write_failpoint`].
+#[cfg(test)]
+pub(crate) fn clear_write_failpoint() {
+    WRITE_FAILPOINT.with(|slot| slot.set(None));
+}
+
+#[cfg(test)]
+fn failpoint_before_write() -> io::Result<()> {
+    WRITE_FAILPOINT.with(|slot| match slot.get() {
+        None => Ok(()),
+        Some(0) => Err(io::Error::new(ErrorKind::Other, "injected write failure")),
+        Some(left) => {
+            slot.set(Some(left - 1));
+            Ok(())
+        }
+    })
 }
 
 struct Frame {
@@ -48,17 +105,22 @@ impl Frame {
     }
 }
 
-/// LRU cache of fixed-size pages.
+/// LRU cache of pages.
 ///
 /// `logical` page count is the file's page count plus pages allocated in
 /// memory and not yet reflected by a shorter file. A newly allocated page is
-/// a zeroed dirty frame and is not written until it is evicted or flushed.
+/// a zeroed dirty frame and is not written until [`Self::flush`]. Dirty
+/// frames stay resident. The pool may hold more than `capacity` frames until
+/// flush or [`Self::discard_dirty`].
 pub struct BufferPool {
     pages: PageManager,
     frames: Vec<Frame>,
+    /// Configured frame count. [`Self::frame_count`] may be higher.
+    capacity: usize,
     logical_pages: u32,
     tick: u64,
     stats: BufferStats,
+    savepoint: Option<Savepoint>,
     #[cfg(test)]
     disk_writes: Vec<u32>,
 }
@@ -84,9 +146,11 @@ impl BufferPool {
         Ok(BufferPool {
             pages,
             frames: pool_frames,
+            capacity: frames,
             logical_pages,
             tick: 0,
             stats: BufferStats::default(),
+            savepoint: None,
             #[cfg(test)]
             disk_writes: Vec::new(),
         })
@@ -100,8 +164,8 @@ impl BufferPool {
     /// Reserves a new zeroed page at the end of the logical file.
     ///
     /// The page is a dirty frame. This does not write that page. If every
-    /// frame is full, the least recently used frame is evicted first, and
-    /// that eviction writes when the victim is dirty.
+    /// frame is full, the least recently used clean frame is evicted. When
+    /// no clean frame can be evicted, the pool grows by one frame.
     pub fn allocate_page(&mut self) -> io::Result<PageId> {
         let index = self.acquire_frame()?;
         let id = PageId(self.logical_pages);
@@ -120,8 +184,7 @@ impl BufferPool {
 
     /// Copies out the page identified by `id`.
     ///
-    /// A page that is still in a frame is returned from that frame, even when
-    /// an earlier eviction extended the file with a hole of zeros at `id`.
+    /// A page that is still in a frame is returned from that frame.
     pub fn read_page(&mut self, id: PageId) -> io::Result<Page> {
         self.ensure_in_range(id)?;
         if let Some(index) = self.find(id) {
@@ -142,9 +205,13 @@ impl BufferPool {
     /// Copies `page` into a frame and marks it dirty.
     ///
     /// The file is not read when `id` is not cached, and it is not written
-    /// until eviction or [`Self::flush`].
+    /// until [`Self::flush`]. The first write of each page after
+    /// [`Self::set_savepoint`] records the page's prior bytes and dirty flag.
     pub fn write_page(&mut self, id: PageId, page: &Page) -> io::Result<()> {
         self.ensure_in_range(id)?;
+        #[cfg(test)]
+        failpoint_before_write()?;
+        self.capture_before_modify(id);
         if let Some(index) = self.find(id) {
             self.install(index, id, page, true);
             return Ok(());
@@ -156,8 +223,9 @@ impl BufferPool {
 
     /// Writes every dirty frame in ascending page id order, then syncs.
     ///
-    /// Dirty flags are cleared. Frames stay cached. Sync runs even when
-    /// nothing is dirty, so writes from an earlier eviction become durable.
+    /// Dirty flags are cleared. Sync runs even when nothing is dirty. Extra
+    /// frames are then dropped, least recently used first, until the pool is
+    /// back to its configured capacity.
     pub fn flush(&mut self) -> io::Result<()> {
         let ids = self.dirty_ids_ascending();
         for id in ids {
@@ -166,7 +234,97 @@ impl BufferPool {
                 .expect("dirty page stays resident until flush");
             self.write_out(index)?;
         }
-        self.pages.sync()
+        self.pages.sync()?;
+        self.shrink();
+        Ok(())
+    }
+
+    /// Drops every dirty frame and forgets pages that were only allocated in
+    /// memory.
+    ///
+    /// Logical page count becomes the on-disk page count. An active savepoint
+    /// is cleared. The pool then shrinks toward its configured capacity.
+    pub fn discard_dirty(&mut self) -> io::Result<()> {
+        self.savepoint = None;
+        let disk_pages = self.pages.page_count()?;
+        self.frames.retain(|frame| {
+            if frame.dirty {
+                return false;
+            }
+            match frame.id {
+                Some(id) => id.0 < disk_pages,
+                None => true,
+            }
+        });
+        self.logical_pages = disk_pages;
+        self.shrink();
+        Ok(())
+    }
+
+    /// Records a baseline for [`Self::rollback_to_savepoint`].
+    ///
+    /// Only one savepoint is kept. A second call is
+    /// [`ErrorKind::InvalidInput`] (`savepoint already set`).
+    pub fn set_savepoint(&mut self) -> io::Result<()> {
+        if self.savepoint.is_some() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "savepoint already set",
+            ));
+        }
+        self.savepoint = Some(Savepoint {
+            logical_pages: self.logical_pages,
+            images: BTreeMap::new(),
+        });
+        Ok(())
+    }
+
+    /// Restores pages to the state at [`Self::set_savepoint`] and keeps it active.
+    ///
+    /// Recorded images are copied back with their prior dirty flags. Pages
+    /// that were not resident are dropped so the next read loads the file.
+    /// Frames whose page id is at or above the logical count from the
+    /// savepoint are dropped, and the logical count is restored. A missing
+    /// savepoint is [`ErrorKind::InvalidInput`] (`no savepoint`).
+    pub fn rollback_to_savepoint(&mut self) -> io::Result<()> {
+        if self.savepoint.is_none() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "no savepoint"));
+        }
+        let logical = self
+            .savepoint
+            .as_ref()
+            .expect("savepoint checked")
+            .logical_pages;
+        let images =
+            std::mem::take(&mut self.savepoint.as_mut().expect("savepoint checked").images);
+        for (raw, image) in images {
+            self.restore_image(PageId(raw), image);
+        }
+        for frame in &mut self.frames {
+            if frame.id.is_some_and(|id| id.0 >= logical) {
+                frame.id = None;
+                frame.dirty = false;
+                frame.tick = 0;
+            }
+        }
+        self.logical_pages = logical;
+        Ok(())
+    }
+
+    /// Forgets the savepoint without restoring pages.
+    ///
+    /// A missing savepoint is [`ErrorKind::InvalidInput`] (`no savepoint`).
+    pub fn release_savepoint(&mut self) -> io::Result<()> {
+        if self.savepoint.take().is_none() {
+            return Err(io::Error::new(ErrorKind::InvalidInput, "no savepoint"));
+        }
+        Ok(())
+    }
+
+    /// Frames currently held, including overflow past the configured capacity.
+    #[cfg(test)]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.frames.len()
     }
 
     /// Counters since [`Self::open`].
@@ -217,16 +375,105 @@ impl BufferPool {
         if let Some(index) = self.frames.iter().position(|frame| frame.id.is_none()) {
             return Ok(index);
         }
-        let index = self
-            .frames
+        if let Some(index) = self.oldest_clean() {
+            self.evict_at(index)?;
+            return Ok(index);
+        }
+        self.frames.push(Frame::empty());
+        self.note_overflow();
+        Ok(self.frames.len() - 1)
+    }
+
+    fn oldest_clean(&self) -> Option<usize> {
+        self.frames
             .iter()
             .enumerate()
-            .filter(|(_, frame)| frame.id.is_some())
+            .filter(|(_, frame)| frame.id.is_some() && !frame.dirty)
             .min_by_key(|(_, frame)| frame.tick)
             .map(|(index, _)| index)
-            .expect("pool has a frame to evict");
-        self.evict_at(index)?;
-        Ok(index)
+    }
+
+    fn note_overflow(&mut self) {
+        let len = self.frames.len();
+        if len > self.capacity {
+            let len = len as u64;
+            if len > self.stats.max_frames {
+                self.stats.max_frames = len;
+            }
+        }
+    }
+
+    /// Drops clean frames, least recently used first, until `capacity`.
+    fn shrink(&mut self) {
+        while self.frames.len() > self.capacity {
+            let Some(index) = self
+                .frames
+                .iter()
+                .enumerate()
+                .filter(|(_, frame)| !frame.dirty)
+                .min_by_key(|(_, frame)| frame.tick)
+                .map(|(index, _)| index)
+            else {
+                break;
+            };
+            if self.frames[index].id.is_some() {
+                self.stats.evictions += 1;
+            }
+            self.frames.remove(index);
+        }
+    }
+
+    fn capture_before_modify(&mut self, id: PageId) {
+        let Some(logical) = self.savepoint.as_ref().map(|save| save.logical_pages) else {
+            return;
+        };
+        if id.0 >= logical {
+            return;
+        }
+        if self
+            .savepoint
+            .as_ref()
+            .expect("savepoint checked")
+            .images
+            .contains_key(&id.0)
+        {
+            return;
+        }
+        let image = if let Some(index) = self.find(id) {
+            PageImage {
+                bytes: Some(copy_page(&self.frames[index].page)),
+                dirty: self.frames[index].dirty,
+            }
+        } else {
+            PageImage {
+                bytes: None,
+                dirty: false,
+            }
+        };
+        self.savepoint
+            .as_mut()
+            .expect("savepoint checked")
+            .images
+            .insert(id.0, image);
+    }
+
+    fn restore_image(&mut self, id: PageId, image: PageImage) {
+        let Some(bytes) = image.bytes else {
+            if let Some(index) = self.find(id) {
+                self.frames[index].id = None;
+                self.frames[index].dirty = false;
+                self.frames[index].tick = 0;
+            }
+            return;
+        };
+        if let Some(index) = self.find(id) {
+            self.install(index, id, &bytes, image.dirty);
+            return;
+        }
+        self.frames.push(Frame::empty());
+        self.note_overflow();
+        let index = self.frames.len() - 1;
+        self.install(index, id, &bytes, image.dirty);
     }
 
     fn evict_at(&mut self, index: usize) -> io::Result<()> {
@@ -437,26 +684,31 @@ mod tests {
     }
 
     #[test]
-    fn dirty_eviction_writes_without_sync_and_a_later_read_sees_it() {
+    fn dirty_pages_are_not_evicted_and_do_not_reach_disk_without_flush() {
         let db = TempDb::new("evict");
         let mut pool = BufferPool::open(db.path(), 1).unwrap();
         let first = pool.allocate_page().unwrap();
         pool.write_page(first, &marked(0xAB)).unwrap();
         let second = pool.allocate_page().unwrap();
-        assert_eq!(pool.stats().evictions, 1);
-        assert_eq!(pool.stats().pages_written, 1);
+        assert_eq!(pool.frame_count(), 2);
+        assert_eq!(pool.stats().evictions, 0);
+        assert_eq!(pool.stats().pages_written, 0);
+        assert_eq!(pool.stats().max_frames, 2);
+        assert_eq!(fs::metadata(db.path()).unwrap().len(), PAGE_SIZE as u64);
         assert_eq!(pool.read_page(first).unwrap().data()[0], 0xAB);
-        assert!(pool.stats().evictions >= 2);
         assert_eq!(pool.read_page(second).unwrap().data()[0], 0);
+        assert_eq!(pool.stats().misses, 0);
         drop(pool);
 
         let mut pool = BufferPool::open(db.path(), 1).unwrap();
-        assert_eq!(pool.read_page(first).unwrap().data()[PAGE_SIZE - 1], 0xAB);
-        assert_eq!(pool.page_count().unwrap(), 3);
+        assert_eq!(pool.page_count().unwrap(), 1);
+        let err = error_of(pool.read_page(first));
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "page out of range: 1");
     }
 
     #[test]
-    fn eviction_of_a_high_page_does_not_hide_a_resident_lower_page() {
+    fn overflow_does_not_write_a_hole_ahead_of_a_dirty_page() {
         let db = TempDb::new("hole");
         let mut pool = BufferPool::open(db.path(), 2).unwrap();
         let mut ids = Vec::new();
@@ -465,31 +717,26 @@ mod tests {
             pool.write_page(id, &marked(byte)).unwrap();
             ids.push(id);
         }
-        // Pages 2 and 3 are cached. Touch page 2, then allocate page 4, which
-        // evicts page 3 past the file end and leaves a hole where page 2 sits.
-        pool.read_page(ids[1]).unwrap();
-        let fourth = pool.allocate_page().unwrap();
-        assert_eq!(fourth, PageId(4));
-        let raw = fs::read(db.path()).unwrap();
-        assert_eq!(raw.len(), 4 * PAGE_SIZE);
-        assert!(raw[2 * PAGE_SIZE..3 * PAGE_SIZE]
-            .iter()
-            .all(|byte| *byte == 0));
-        assert_eq!(raw[3 * PAGE_SIZE], 3);
+        assert!(pool.frame_count() > 2);
+        assert_eq!(pool.stats().pages_written, 0);
+        assert_eq!(pool.stats().evictions, 0);
+        assert_eq!(fs::metadata(db.path()).unwrap().len(), PAGE_SIZE as u64);
         assert_eq!(pool.read_page(ids[1]).unwrap().data()[0], 2);
-
         let start = pool.disk_writes.len();
-        assert_eq!(pool.dirty_ids_ascending(), vec![PageId(2), PageId(4)]);
+        assert_eq!(
+            pool.dirty_ids_ascending(),
+            vec![PageId(1), PageId(2), PageId(3)]
+        );
         pool.flush().unwrap();
-        assert_eq!(&pool.disk_writes[start..], &[2, 4]);
+        assert_eq!(&pool.disk_writes[start..], &[1, 2, 3]);
+        assert!(pool.frame_count() <= 2);
         drop(pool);
 
         let mut pages = PageManager::open(db.path()).unwrap();
-        assert_eq!(pages.page_count().unwrap(), 5);
+        assert_eq!(pages.page_count().unwrap(), 4);
         assert_eq!(pages.read_page(PageId(1)).unwrap().data()[0], 1);
         assert_eq!(pages.read_page(PageId(2)).unwrap().data()[0], 2);
         assert_eq!(pages.read_page(PageId(3)).unwrap().data()[0], 3);
-        assert_eq!(pages.read_page(PageId(4)).unwrap().data()[0], 0);
     }
 
     #[test]
@@ -596,5 +843,191 @@ mod tests {
         assert_eq!(pool.page_count().unwrap(), 1);
         assert_eq!(pool.stats(), BufferStats::default());
         assert_eq!(pool.stats().evictions, 0);
+    }
+
+    fn dirty_of(pool: &BufferPool, id: PageId) -> Option<bool> {
+        pool.frames
+            .iter()
+            .find(|frame| frame.id == Some(id))
+            .map(|frame| frame.dirty)
+    }
+
+    #[test]
+    fn savepoint_restores_bytes_and_dirty_flags() {
+        let db = TempDb::new("sp-dirty");
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        let id = pool.allocate_page().unwrap();
+        pool.write_page(id, &marked(1)).unwrap();
+        assert_eq!(dirty_of(&pool, id), Some(true));
+        pool.set_savepoint().unwrap();
+        pool.write_page(id, &marked(2)).unwrap();
+        pool.write_page(id, &marked(3)).unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 3);
+        pool.rollback_to_savepoint().unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 1);
+        assert_eq!(pool.read_page(id).unwrap().data()[PAGE_SIZE - 1], 1);
+        assert_eq!(dirty_of(&pool, id), Some(true));
+        let written = pool.stats().pages_written;
+        pool.flush().unwrap();
+        assert_eq!(pool.stats().pages_written, written + 1);
+        drop(pool);
+
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 1);
+
+        pool.write_page(id, &marked(4)).unwrap();
+        pool.flush().unwrap();
+        pool.set_savepoint().unwrap();
+        pool.write_page(id, &marked(5)).unwrap();
+        assert_eq!(dirty_of(&pool, id), Some(true));
+        pool.rollback_to_savepoint().unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 4);
+        assert_eq!(dirty_of(&pool, id), Some(false));
+        let written = pool.stats().pages_written;
+        pool.flush().unwrap();
+        assert_eq!(pool.stats().pages_written, written);
+        pool.release_savepoint().unwrap();
+    }
+
+    #[test]
+    fn savepoint_drops_pages_allocated_after_it() {
+        let db = TempDb::new("sp-alloc");
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        let kept = pool.allocate_page().unwrap();
+        pool.write_page(kept, &marked(7)).unwrap();
+        let before = fs::read(db.path()).unwrap();
+        let count = pool.page_count().unwrap();
+        pool.set_savepoint().unwrap();
+        let created = pool.allocate_page().unwrap();
+        pool.write_page(created, &marked(8)).unwrap();
+        pool.write_page(kept, &marked(9)).unwrap();
+        assert_eq!(pool.page_count().unwrap(), count + 1);
+        pool.rollback_to_savepoint().unwrap();
+        assert_eq!(pool.page_count().unwrap(), count);
+        assert_eq!(pool.read_page(kept).unwrap().data()[0], 7);
+        assert_eq!(dirty_of(&pool, kept), Some(true));
+        let err = error_of(pool.read_page(created));
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        pool.release_savepoint().unwrap();
+        pool.flush().unwrap();
+        drop(pool);
+
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        assert_eq!(pool.page_count().unwrap(), count);
+        assert_eq!(pool.read_page(kept).unwrap().data()[0], 7);
+    }
+
+    #[test]
+    fn savepoint_rollback_survives_eviction_of_clean_frames() {
+        let db = TempDb::new("sp-evict");
+        let mut setup = BufferPool::open(db.path(), 4).unwrap();
+        let mut ids = Vec::new();
+        for byte in 1..=3 {
+            let id = setup.allocate_page().unwrap();
+            setup.write_page(id, &marked(byte)).unwrap();
+            ids.push(id);
+        }
+        setup.flush().unwrap();
+        drop(setup);
+
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        pool.read_page(ids[0]).unwrap();
+        pool.read_page(ids[1]).unwrap();
+        pool.set_savepoint().unwrap();
+        pool.write_page(ids[0], &marked(9)).unwrap();
+        assert_eq!(dirty_of(&pool, ids[0]), Some(true));
+        let evictions = pool.stats().evictions;
+        pool.read_page(ids[2]).unwrap();
+        assert_eq!(pool.stats().evictions, evictions + 1);
+        assert!(dirty_of(&pool, ids[1]).is_none());
+        pool.write_page(ids[2], &marked(8)).unwrap();
+        pool.rollback_to_savepoint().unwrap();
+        assert_eq!(pool.read_page(ids[0]).unwrap().data()[0], 1);
+        assert_eq!(dirty_of(&pool, ids[0]), Some(false));
+        assert_eq!(pool.read_page(ids[2]).unwrap().data()[0], 3);
+        assert_eq!(dirty_of(&pool, ids[2]), Some(false));
+        assert_eq!(pool.read_page(ids[1]).unwrap().data()[0], 2);
+        let written = pool.stats().pages_written;
+        pool.flush().unwrap();
+        assert_eq!(pool.stats().pages_written, written);
+    }
+
+    #[test]
+    fn savepoint_of_a_cold_page_reloads_from_disk() {
+        let db = TempDb::new("sp-cold");
+        let mut setup = BufferPool::open(db.path(), 2).unwrap();
+        let id = setup.allocate_page().unwrap();
+        setup.write_page(id, &marked(4)).unwrap();
+        let other = setup.allocate_page().unwrap();
+        setup.write_page(other, &marked(1)).unwrap();
+        setup.flush().unwrap();
+        drop(setup);
+
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        pool.read_page(other).unwrap();
+        assert!(dirty_of(&pool, id).is_none());
+        pool.set_savepoint().unwrap();
+        pool.write_page(id, &marked(9)).unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 9);
+        pool.rollback_to_savepoint().unwrap();
+        assert!(dirty_of(&pool, id).is_none());
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 4);
+        assert_eq!(pool.stats().pages_written, 0);
+    }
+
+    #[test]
+    fn overflow_discard_and_flush_shrink_back_to_capacity() {
+        let db = TempDb::new("overflow");
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        let before = fs::read(db.path()).unwrap();
+        for byte in 1..=20 {
+            let id = pool.allocate_page().unwrap();
+            pool.write_page(id, &marked(byte)).unwrap();
+        }
+        assert!(pool.frame_count() >= 20);
+        assert!(pool.stats().max_frames >= 20);
+        assert_eq!(pool.stats().pages_written, 0);
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        pool.discard_dirty().unwrap();
+        assert_eq!(pool.page_count().unwrap(), 1);
+        assert!(pool.frame_count() <= 2);
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        assert!(pool.savepoint.is_none());
+
+        for byte in 1..=20 {
+            let id = pool.allocate_page().unwrap();
+            pool.write_page(id, &marked(byte)).unwrap();
+        }
+        pool.flush().unwrap();
+        assert!(pool.frame_count() <= 2);
+        assert_eq!(pool.page_count().unwrap(), 21);
+        drop(pool);
+
+        let mut pool = BufferPool::open(db.path(), 2).unwrap();
+        assert_eq!(pool.page_count().unwrap(), 21);
+        assert_eq!(pool.read_page(PageId(1)).unwrap().data()[0], 1);
+        assert_eq!(pool.read_page(PageId(20)).unwrap().data()[0], 20);
+    }
+
+    #[test]
+    fn savepoint_errors_and_release_keeps_the_write() {
+        let db = TempDb::new("sp-err");
+        let mut pool = BufferPool::open(db.path(), 1).unwrap();
+        let err = error_of(pool.rollback_to_savepoint());
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "no savepoint");
+        let err = error_of(pool.release_savepoint());
+        assert_eq!(err.to_string(), "no savepoint");
+        let id = pool.allocate_page().unwrap();
+        pool.set_savepoint().unwrap();
+        let err = error_of(pool.set_savepoint());
+        assert_eq!(err.to_string(), "savepoint already set");
+        pool.write_page(id, &marked(6)).unwrap();
+        pool.release_savepoint().unwrap();
+        assert_eq!(pool.read_page(id).unwrap().data()[0], 6);
+        assert_eq!(dirty_of(&pool, id), Some(true));
+        let err = error_of(pool.rollback_to_savepoint());
+        assert_eq!(err.to_string(), "no savepoint");
     }
 }

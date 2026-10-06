@@ -22,6 +22,12 @@ pub enum Statement {
     Update(Update),
     /// `DELETE`.
     Delete(Delete),
+    /// `BEGIN` or `BEGIN TRANSACTION`.
+    Begin,
+    /// `COMMIT`.
+    Commit,
+    /// `ROLLBACK`.
+    Rollback,
 }
 
 /// `CREATE TABLE name (column type, ...)`.
@@ -271,6 +277,9 @@ impl fmt::Display for Statement {
             Statement::Select(statement) => write!(f, "{statement}"),
             Statement::Update(statement) => write!(f, "{statement}"),
             Statement::Delete(statement) => write!(f, "{statement}"),
+            Statement::Begin => f.write_str("BEGIN"),
+            Statement::Commit => f.write_str("COMMIT"),
+            Statement::Rollback => f.write_str("ROLLBACK"),
         }
     }
 }

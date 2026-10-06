@@ -76,9 +76,21 @@ impl Parser {
             Ok(Statement::Update(self.parse_update()?))
         } else if self.at_keyword(Keyword::Delete) {
             Ok(Statement::Delete(self.parse_delete()?))
+        } else if self.at_keyword(Keyword::Begin) {
+            self.parse_begin()
+        } else if self.eat_keyword(Keyword::Commit) {
+            Ok(Statement::Commit)
+        } else if self.eat_keyword(Keyword::Rollback) {
+            Ok(Statement::Rollback)
         } else {
             Err(self.expected("statement"))
         }
+    }
+
+    fn parse_begin(&mut self) -> io::Result<Statement> {
+        self.expect_keyword(Keyword::Begin)?;
+        let _ = self.eat_keyword(Keyword::Transaction);
+        Ok(Statement::Begin)
     }
 
     fn parse_create(&mut self) -> io::Result<CreateTable> {
@@ -734,6 +746,22 @@ mod tests {
     }
 
     #[test]
+    fn begin_commit_and_rollback_round_trip() {
+        assert_eq!(parse_one("BEGIN"), Statement::Begin);
+        assert_eq!(parse_one("BEGIN TRANSACTION"), Statement::Begin);
+        assert_eq!(parse_one("begin transaction"), Statement::Begin);
+        assert_eq!(parse_one("COMMIT"), Statement::Commit);
+        assert_eq!(parse_one("ROLLBACK"), Statement::Rollback);
+        assert_eq!(parse_one("BEGIN TRANSACTION").to_string(), "BEGIN");
+        assert_eq!(parse_one("commit").to_string(), "COMMIT");
+        assert_eq!(parse_one("Rollback").to_string(), "ROLLBACK");
+        assert_eq!(
+            parse("BEGIN; COMMIT; ROLLBACK").unwrap(),
+            vec![Statement::Begin, Statement::Commit, Statement::Rollback]
+        );
+    }
+
+    #[test]
     fn create_table_insert_select_update_delete() {
         assert_eq!(
             parse_one("CREATE TABLE users (id INTEGER, name TEXT)"),
@@ -1215,6 +1243,11 @@ DELETE FROM users";
             "UPDATE users SET name = 'x'",
             "DELETE FROM users WHERE id != 1",
             "DELETE FROM users",
+            "BEGIN",
+            "BEGIN TRANSACTION",
+            "begin transaction",
+            "COMMIT",
+            "ROLLBACK",
             "SELECT * FROM t; INSERT INTO t VALUES (1)",
             "INSERT INTO t VALUES ('a\nb'); SELECT * FROM t",
             "-- c\nSELECT * FROM t -- tail",
