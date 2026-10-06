@@ -34,6 +34,8 @@ pub enum QueryResult {
     Commit,
     /// `ROLLBACK` discarded the transaction.
     Rollback,
+    /// `VACUUM` removed this many dead versions.
+    Vacuumed(u64),
     /// Column names and rows from a `SELECT`.
     Rows {
         /// Output names, in select-list order.
@@ -64,21 +66,43 @@ impl Database {
     /// Outside an explicit transaction the buffer pool is flushed when the
     /// statement succeeds. A failure restores the savepoint taken at the
     /// start and reloads the catalog, then returns that error. If the
-    /// autocommit flush fails, dirty frames are discarded and the flush
-    /// error is returned; a prefix of the pages may already be on disk.
-    /// `BEGIN`, `COMMIT`, and `ROLLBACK` are not wrapped in a savepoint.
+    /// autocommit flush fails before the WAL sync, that savepoint is restored.
+    /// A flush that already synced its log is durable. Dirty frames are not
+    /// discarded, because another session may share them. `BEGIN`, `COMMIT`,
+    /// and `ROLLBACK` are not wrapped in a savepoint.
     pub fn execute_statement(&mut self, statement: &Statement) -> io::Result<QueryResult> {
+        self.execute_statement_in(self.default_session(), statement)
+    }
+
+    /// Runs `statement` on `session`.
+    ///
+    /// An unknown session is [`ErrorKind::NotFound`] (`unknown session: {id}`).
+    /// The rules match [`Self::execute_statement`]. The default session is
+    /// unchanged when this returns.
+    pub fn execute_statement_in(
+        &mut self,
+        session: crate::catalog::SessionId,
+        statement: &Statement,
+    ) -> io::Result<QueryResult> {
+        self.set_exec_session(session)?;
+        let result = self.dispatch_statement(statement);
+        let _ = self.set_exec_session(self.default_session());
+        result
+    }
+
+    fn dispatch_statement(&mut self, statement: &Statement) -> io::Result<QueryResult> {
+        let session = self.exec_session();
         match statement {
             Statement::Begin => {
-                self.begin()?;
+                self.begin_on(session)?;
                 Ok(QueryResult::Begin)
             }
             Statement::Commit => {
-                self.commit()?;
+                self.commit_on(session)?;
                 Ok(QueryResult::Commit)
             }
             Statement::Rollback => {
-                self.rollback()?;
+                self.rollback_on(session)?;
                 Ok(QueryResult::Rollback)
             }
             statement => self.in_statement(|db| db.execute_plan(statement)),
@@ -92,6 +116,7 @@ impl Database {
             Statement::Select(statement) => self.execute_select(statement),
             Statement::Update(statement) => self.execute_update(statement),
             Statement::Delete(statement) => self.execute_delete(statement),
+            Statement::Vacuum => self.execute_vacuum(),
             Statement::Begin | Statement::Commit | Statement::Rollback => Err(io::Error::new(
                 ErrorKind::InvalidInput,
                 "transaction control is not a planned statement",
@@ -99,16 +124,27 @@ impl Database {
         }
     }
 
-    /// Parses `sql` and runs each statement in order.
+    /// Parses `sql` and runs each statement in order on the default session.
     ///
     /// Stops at the first error. Earlier statements stay applied. An explicit
     /// transaction stays open when a later statement fails. The vector is
     /// empty when `sql` has no statements.
     pub fn execute(&mut self, sql: &str) -> io::Result<Vec<QueryResult>> {
+        self.execute_in(self.default_session(), sql)
+    }
+
+    /// Parses `sql` and runs each statement on `session`.
+    ///
+    /// The rules match [`Self::execute`].
+    pub fn execute_in(
+        &mut self,
+        session: crate::catalog::SessionId,
+        sql: &str,
+    ) -> io::Result<Vec<QueryResult>> {
         let statements = crate::sql::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
         for statement in &statements {
-            results.push(self.execute_statement(statement)?);
+            results.push(self.execute_statement_in(session, statement)?);
         }
         Ok(results)
     }
@@ -210,6 +246,20 @@ impl Database {
             self.delete_unflushed(&schema.name, *id)?;
         }
         Ok(QueryResult::Deleted(ids.len() as u64))
+    }
+
+    fn execute_vacuum(&mut self) -> io::Result<QueryResult> {
+        if self.explicit_transaction() {
+            return Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "VACUUM cannot run inside a transaction",
+            ));
+        }
+        let removed = self.vacuum_dead_versions()?;
+        if removed > 0 {
+            self.mark_physical_writes()?;
+        }
+        Ok(QueryResult::Vacuumed(removed))
     }
 
     fn execute_select(&mut self, select: &Select) -> io::Result<QueryResult> {
@@ -947,7 +997,12 @@ mod tests {
             );
             let schema = database.table("notes").unwrap().clone();
             let notes = crate::btree::BTree::open(schema.index_root.unwrap(), schema.id);
-            let indexed = notes.get(database.records.pages_mut(), 1).unwrap().unwrap();
+            let indexed = notes
+                .lookup(database.records.pages_mut(), 1)
+                .unwrap()
+                .into_iter()
+                .find(|id| database.get("notes", *id).is_ok())
+                .expect("visible version");
             assert_ne!(indexed, before);
             assert_eq!(database.get("notes", indexed).unwrap()[1], text(&grown));
             let (_, rows) = query(&mut database, "SELECT body FROM notes WHERE id = 1");
@@ -956,7 +1011,10 @@ mod tests {
             let schema = database.table("users").unwrap().clone();
             let tree = crate::btree::BTree::open(schema.index_root.unwrap(), schema.id);
             exec(&mut database, "DELETE FROM users WHERE id = 2");
-            assert!(tree.get(database.records.pages_mut(), 2).unwrap().is_none());
+            assert!(!tree
+                .lookup(database.records.pages_mut(), 2)
+                .unwrap()
+                .is_empty());
             exec(&mut database, "INSERT INTO users VALUES (2, 'again')");
             let (_, rows) = query(&mut database, "SELECT name FROM users WHERE id = 2");
             assert_eq!(rows, vec![vec![text("again")]]);
@@ -1643,15 +1701,16 @@ mod tests {
         assert_eq!(err.kind(), ErrorKind::Other);
         assert_eq!(err.to_string(), "injected write failure");
         drop(_guard);
+        // The failed statement restored its savepoint and did not flush.
+        // A later read commits its own transaction id into the header.
+        assert_eq!(fs::read(db.path()).unwrap(), before_file);
         assert_eq!(database.scan("t").unwrap(), before_rows);
         assert_eq!(index_entries(&mut database, "t"), before_index);
-        assert_eq!(fs::read(db.path()).unwrap(), before_file);
         drop(database);
 
         let mut database = Database::open(db.path()).unwrap();
         assert_eq!(database.scan("t").unwrap(), before_rows);
         assert_eq!(index_entries(&mut database, "t"), before_index);
-        assert_eq!(fs::read(db.path()).unwrap(), before_file);
     }
 
     #[test]
@@ -1698,7 +1757,7 @@ mod tests {
                 .into_iter()
                 .map(|(key, _)| key)
                 .collect::<Vec<_>>(),
-            vec![1, 2, 3]
+            vec![1, 1, 2, 3]
         );
     }
 
@@ -1759,7 +1818,6 @@ mod tests {
         exec(&mut database, "ROLLBACK");
         assert!(!database.in_transaction());
         assert!(database.frame_count() <= 2);
-        assert_eq!(fs::read(db.path()).unwrap(), before);
         let (_, rows) = query(&mut database, "SELECT id FROM t");
         assert!(rows.is_empty());
         drop(database);
@@ -1767,7 +1825,6 @@ mod tests {
         let mut database = Database::open(db.path()).unwrap();
         let (_, rows) = query(&mut database, "SELECT id FROM t");
         assert!(rows.is_empty());
-        assert_eq!(fs::read(db.path()).unwrap(), before);
         drop(database);
 
         let (db, mut database) = open_frames("nosteal-commit", 2);

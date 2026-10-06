@@ -2,9 +2,10 @@ use std::env;
 use std::io::{self, BufRead, IsTerminal, Write};
 use std::process::ExitCode;
 
+use sqltoy::sql::Statement;
 use sqltoy::{
     format_result, Column, ColumnSpec, ColumnType, Database, PageId, PageManager, RecordFile,
-    RecordId, Storage, TableId, Value, PAGE_SIZE,
+    RecordId, SessionId, Storage, TableId, Value, PAGE_SIZE,
 };
 
 const USAGE: &str = "\
@@ -363,8 +364,18 @@ fn run_sql(db: &mut Database, sql: &str) -> io::Result<()> {
     Ok(())
 }
 
+struct ReplSession {
+    name: String,
+    id: SessionId,
+}
+
 fn cmd_repl(path: &str) -> io::Result<()> {
     let mut db = Database::open(path)?;
+    let mut sessions = vec![ReplSession {
+        name: "main".to_string(),
+        id: db.default_session(),
+    }];
+    let mut current = 0usize;
     let interactive = io::stdin().is_terminal();
     let stdin = io::stdin();
     let mut input = stdin.lock();
@@ -372,11 +383,8 @@ fn cmd_repl(path: &str) -> io::Result<()> {
     loop {
         if interactive {
             if buffer.trim().is_empty() {
-                if db.in_transaction() {
-                    print!("sqltoy*> ");
-                } else {
-                    print!("sqltoy> ");
-                }
+                let open = db.session_in_transaction(sessions[current].id)?;
+                print!("{}", prompt(&sessions[current].name, open));
             } else {
                 print!("   ...> ");
             }
@@ -385,28 +393,87 @@ fn cmd_repl(path: &str) -> io::Result<()> {
         let mut line = String::new();
         if input.read_line(&mut line)? == 0 {
             if !buffer.trim().is_empty() {
-                run_buffer(&mut db, &buffer);
+                run_buffer(&mut db, sessions[current].id, &buffer);
             }
             break;
         }
         // Dot commands apply only when no statement is in progress.
         if buffer.trim().is_empty() {
-            match line.trim() {
-                ".quit" | ".exit" => break,
-                ".stats" => {
-                    print_buffer_stats(&db);
+            let trimmed = line.trim();
+            if trimmed == ".quit" || trimmed == ".exit" {
+                break;
+            }
+            if trimmed == ".stats" {
+                print_buffer_stats(&db);
+                continue;
+            }
+            if let Some(name) = trimmed.strip_prefix(".session") {
+                let name = name.trim();
+                if !valid_session_name(name) {
+                    eprintln!("error: invalid session name");
                     continue;
                 }
-                _ => {}
+                current = switch_session(&mut db, &mut sessions, name);
+                continue;
             }
         }
         buffer.push_str(&line);
         if buffer.trim_end().ends_with(';') {
-            run_buffer(&mut db, &buffer);
+            run_buffer(&mut db, sessions[current].id, &buffer);
             buffer.clear();
         }
     }
-    rollback_if_open(&mut db)?;
+    rollback_open_sessions(&mut db, &sessions)?;
+    Ok(())
+}
+
+fn valid_session_name(name: &str) -> bool {
+    !name.is_empty()
+        && name
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || byte == b'_')
+}
+
+fn prompt(name: &str, open: bool) -> String {
+    if name == "main" {
+        if open {
+            "sqltoy*> ".to_string()
+        } else {
+            "sqltoy> ".to_string()
+        }
+    } else if open {
+        format!("sqltoy:{name}*> ")
+    } else {
+        format!("sqltoy:{name}> ")
+    }
+}
+
+fn switch_session(db: &mut Database, sessions: &mut Vec<ReplSession>, name: &str) -> usize {
+    if let Some(index) = sessions.iter().position(|session| session.name == name) {
+        return index;
+    }
+    let id = db.create_session();
+    sessions.push(ReplSession {
+        name: name.to_string(),
+        id,
+    });
+    sessions.len() - 1
+}
+
+fn rollback_open_sessions(db: &mut Database, sessions: &[ReplSession]) -> io::Result<()> {
+    for session in sessions {
+        if db.session_in_transaction(session.id)? {
+            if session.name == "main" {
+                eprintln!("warning: transaction rolled back");
+            } else {
+                eprintln!(
+                    "warning: transaction rolled back (session {})",
+                    session.name
+                );
+            }
+            db.execute_statement_in(session.id, &Statement::Rollback)?;
+        }
+    }
     Ok(())
 }
 
@@ -426,7 +493,7 @@ fn print_buffer_stats(db: &Database) {
     );
 }
 
-fn run_buffer(db: &mut Database, sql: &str) {
+fn run_buffer(db: &mut Database, session: SessionId, sql: &str) {
     let statements = match sqltoy::sql::parse(sql) {
         Ok(statements) => statements,
         Err(err) => {
@@ -435,7 +502,7 @@ fn run_buffer(db: &mut Database, sql: &str) {
         }
     };
     for statement in &statements {
-        match db.execute_statement(statement) {
+        match db.execute_statement_in(session, statement) {
             Ok(result) => {
                 println!("{}", format_result(&result));
                 let _ = io::stdout().flush();

@@ -82,6 +82,8 @@ impl Parser {
             Ok(Statement::Commit)
         } else if self.eat_keyword(Keyword::Rollback) {
             Ok(Statement::Rollback)
+        } else if self.eat_keyword(Keyword::Vacuum) {
+            Ok(Statement::Vacuum)
         } else {
             Err(self.expected("statement"))
         }
@@ -752,6 +754,8 @@ mod tests {
         assert_eq!(parse_one("begin transaction"), Statement::Begin);
         assert_eq!(parse_one("COMMIT"), Statement::Commit);
         assert_eq!(parse_one("ROLLBACK"), Statement::Rollback);
+        assert_eq!(parse_one("VACUUM"), Statement::Vacuum);
+        assert_eq!(parse_one("vacuum").to_string(), "VACUUM");
         assert_eq!(parse_one("BEGIN TRANSACTION").to_string(), "BEGIN");
         assert_eq!(parse_one("commit").to_string(), "COMMIT");
         assert_eq!(parse_one("Rollback").to_string(), "ROLLBACK");

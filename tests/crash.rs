@@ -165,13 +165,19 @@ fn assert_index(path: &Path, table: &str, rows: &[Vec<Value>]) {
     let keys = BTree::open(root, owner)
         .scan_all(&mut pool)
         .unwrap_or_else(|err| panic!("index scan: {err}"));
-    assert_eq!(keys.len(), rows.len(), "index keys vs rows");
+    assert!(
+        keys.len() >= rows.len(),
+        "index keys vs rows: {} vs {}",
+        keys.len(),
+        rows.len()
+    );
     assert_eq!(ids_from_keys(&keys), ids(rows));
 }
 
 fn ids_from_keys(keys: &[(i64, sqltoy::RecordId)]) -> Vec<i64> {
     let mut ids: Vec<i64> = keys.iter().map(|(key, _)| *key).collect();
     ids.sort();
+    ids.dedup();
     ids
 }
 

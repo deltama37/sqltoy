@@ -29,6 +29,7 @@ pub fn format_result(result: &QueryResult) -> String {
         QueryResult::Begin => "BEGIN".to_string(),
         QueryResult::Commit => "COMMIT".to_string(),
         QueryResult::Rollback => "ROLLBACK".to_string(),
+        QueryResult::Vacuumed(count) => format!("VACUUM {count}"),
         QueryResult::Rows { columns, rows } => format_table(columns, rows),
     }
 }
@@ -152,6 +153,7 @@ mod tests {
         assert_eq!(format_result(&QueryResult::Begin), "BEGIN");
         assert_eq!(format_result(&QueryResult::Commit), "COMMIT");
         assert_eq!(format_result(&QueryResult::Rollback), "ROLLBACK");
+        assert_eq!(format_result(&QueryResult::Vacuumed(4)), "VACUUM 4");
     }
 
     #[test]
