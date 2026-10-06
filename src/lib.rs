@@ -2,8 +2,10 @@
 //!
 //! The storage layer addresses one local file by byte offset. The page layer
 //! manages that file as fixed-size pages, with page 0 reserved as a header.
-//! The record layer stores variable-length records in slotted pages and
-//! addresses them by record id. The catalog layer records table schemas in
+//! The buffer pool caches those pages in a fixed number of frames and flushes
+//! dirty pages at the end of a SQL statement. The record layer stores
+//! variable-length records in slotted pages and addresses them by record id.
+//! The catalog layer records table schemas in
 //! the file and restores them when the database is opened. The table layer
 //! stores typed rows in those tables, including NULL. The SQL parser turns
 //! `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and `DELETE` text into an
@@ -15,6 +17,7 @@
 //! in `docs/adr/`.
 
 pub mod btree;
+pub mod buffer;
 pub mod catalog;
 pub mod exec;
 pub mod page;
@@ -26,6 +29,7 @@ pub mod storage;
 pub mod table;
 
 pub use btree::BTree;
+pub use buffer::{BufferPool, BufferStats, DEFAULT_POOL_PAGES};
 pub use catalog::{Column, ColumnSpec, ColumnType, Database, TableSchema};
 pub use exec::{format_result, QueryResult};
 pub use page::{Page, PageId, PageManager, PAGE_SIZE};

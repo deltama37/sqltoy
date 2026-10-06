@@ -9,6 +9,7 @@ use std::path::Path;
 use std::str::FromStr;
 
 use crate::btree::BTree;
+use crate::buffer::{BufferStats, DEFAULT_POOL_PAGES};
 use crate::page::PageId;
 use crate::record::{RecordFile, RecordId, TableId, MAX_RECORD_SIZE};
 
@@ -114,6 +115,12 @@ pub struct TableSchema {
 }
 
 /// An open database file and the schemas loaded from its catalog.
+///
+/// Pages sit in a [`crate::buffer::BufferPool`]. [`Self::execute_statement`]
+/// and the public table methods flush it once when they return, including
+/// when the call fails. A flush failure after an error is discarded so the
+/// original error is what the caller sees. Helpers used inside one statement
+/// do not flush on their own, so a multi-row insert syncs once.
 pub struct Database {
     pub(crate) records: RecordFile,
     tables: Vec<TableSchema>,
@@ -122,12 +129,20 @@ pub struct Database {
 impl Database {
     /// Opens the database at `path` and loads every catalog record.
     ///
-    /// An empty file is created. Schemas are ordered by table id. A record
-    /// that does not match the catalog layout, an unknown column type, a
-    /// table id below [`TableId::FIRST_USER`], or a duplicate id or name is
+    /// Uses [`DEFAULT_POOL_PAGES`] frames. An empty file is created. Schemas
+    /// are ordered by table id. A record that does not match the catalog
+    /// layout, an unknown column type, a table id below
+    /// [`TableId::FIRST_USER`], or a duplicate id or name is
     /// [`ErrorKind::InvalidData`].
     pub fn open<P: AsRef<Path>>(path: P) -> io::Result<Database> {
-        let mut records = RecordFile::open(path)?;
+        Self::open_with_frames(path, DEFAULT_POOL_PAGES)
+    }
+
+    /// Opens `path` with `frames` buffer-pool frames and loads the catalog.
+    ///
+    /// `frames` must be at least 1. The catalog rules match [`Self::open`].
+    pub fn open_with_frames<P: AsRef<Path>>(path: P, frames: usize) -> io::Result<Database> {
+        let mut records = RecordFile::open_pooled(path, frames)?;
         let mut tables: Vec<TableSchema> = Vec::new();
         for (rid, bytes) in records.scan(TableId::CATALOG)? {
             let schema = decode_catalog_record(rid, &bytes)?;
@@ -146,7 +161,7 @@ impl Database {
         Ok(Database { records, tables })
     }
 
-    /// Creates a user table and syncs its catalog record.
+    /// Creates a user table and flushes its catalog record.
     ///
     /// The assigned id is one greater than the highest user-table id already
     /// in the catalog, or [`TableId::FIRST_USER`] when there is none. `name`
@@ -160,11 +175,27 @@ impl Database {
     ///
     /// A primary key allocates an empty B+Tree leaf before the catalog record
     /// is written. Tables without a primary key have no index.
+    ///
+    /// The buffer pool is flushed before this returns. A flush failure after
+    /// a failed call is discarded and the original error is returned.
     pub fn create_table(
         &mut self,
         name: &str,
         columns: &[ColumnSpec<'_>],
     ) -> io::Result<&TableSchema> {
+        let created = self.create_table_unflushed(name, columns);
+        self.persist(created)?;
+        Ok(&self.tables[self.tables.len() - 1])
+    }
+
+    /// Creates a user table without flushing.
+    ///
+    /// [`Self::execute_statement`] and [`Self::create_table`] flush once.
+    pub(crate) fn create_table_unflushed(
+        &mut self,
+        name: &str,
+        columns: &[ColumnSpec<'_>],
+    ) -> io::Result<()> {
         check_identifier(name)?;
         if columns.is_empty() {
             return Err(io::Error::new(
@@ -227,12 +258,32 @@ impl Database {
         let bytes = encode_schema(&schema)?;
         self.records.insert(TableId::CATALOG, &bytes)?;
         self.tables.push(schema);
-        Ok(&self.tables[self.tables.len() - 1])
+        Ok(())
     }
 
-    /// Pages read since this database was opened.
+    /// Logical page reads since this database was opened.
+    ///
+    /// Each buffer-pool read counts once, hit or miss, so index and limit
+    /// checks do not depend on which pages are cached. The counter is not
+    /// stored in the file.
     pub fn pages_read(&self) -> u64 {
         self.records.pages_read()
+    }
+
+    /// Buffer-pool counters since this database was opened.
+    pub fn buffer_stats(&self) -> BufferStats {
+        self.records.buffer_stats()
+    }
+
+    /// Flushes the pool. On failure, keeps `result`'s error when it failed.
+    pub(crate) fn persist<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        match self.records.flush() {
+            Ok(()) => result,
+            Err(flush_err) => match result {
+                Err(original) => Err(original),
+                Ok(_) => Err(flush_err),
+            },
+        }
     }
 
     /// Returns the schema named `name`, ignoring ASCII case.

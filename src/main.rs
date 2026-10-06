@@ -378,9 +378,16 @@ fn cmd_repl(path: &str) -> io::Result<()> {
             }
             break;
         }
-        // `.quit` applies only when no statement is in progress.
-        if buffer.trim().is_empty() && matches!(line.trim(), ".quit" | ".exit") {
-            break;
+        // Dot commands apply only when no statement is in progress.
+        if buffer.trim().is_empty() {
+            match line.trim() {
+                ".quit" | ".exit" => break,
+                ".stats" => {
+                    print_buffer_stats(&db);
+                    continue;
+                }
+                _ => {}
+            }
         }
         buffer.push_str(&line);
         if buffer.trim_end().ends_with(';') {
@@ -389,6 +396,14 @@ fn cmd_repl(path: &str) -> io::Result<()> {
         }
     }
     Ok(())
+}
+
+fn print_buffer_stats(db: &Database) {
+    let stats = db.buffer_stats();
+    println!(
+        "logical reads: {}, hits: {}, misses: {}, pages written: {}, evictions: {}",
+        stats.logical_reads, stats.hits, stats.misses, stats.pages_written, stats.evictions
+    );
 }
 
 fn run_buffer(db: &mut Database, sql: &str) {

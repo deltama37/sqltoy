@@ -144,9 +144,20 @@ impl PageManager {
 
     /// Overwrites the page identified by `id`.
     ///
-    /// The write stays buffered until [`Self::sync`].
+    /// The write stays buffered until [`Self::sync`]. `id` must already be in
+    /// the file. The buffer pool uses [`Self::write_page_extending`] when a
+    /// frame it allocated is ahead of the file.
     pub fn write_page(&mut self, id: PageId, page: &Page) -> io::Result<()> {
         self.ensure_in_range(id)?;
+        self.storage.write_at(id.offset(), page.data())
+    }
+
+    /// Writes `page` at `id`, extending the file when `id` is past the end.
+    ///
+    /// A gap between the old end and `id` reads back as zeros. The write stays
+    /// buffered until [`Self::sync`]. After the file is reopened, [`Self::page_count`]
+    /// is one past the highest page written.
+    pub(crate) fn write_page_extending(&mut self, id: PageId, page: &Page) -> io::Result<()> {
         self.storage.write_at(id.offset(), page.data())
     }
 
@@ -405,6 +416,26 @@ mod tests {
 
         let err = error_of(PageManager::open(db.path()));
         assert_eq!(err.kind(), ErrorKind::InvalidData);
+    }
+
+    #[test]
+    fn write_past_the_end_extends_the_file_and_leaves_a_zero_hole() {
+        let db = TempDb::new("extend");
+        let mut pages = PageManager::open(db.path()).unwrap();
+        let mut page = Page::zeroed();
+        page.data_mut()[0] = 7;
+        pages.write_page_extending(PageId(2), &page).unwrap();
+        pages.sync().unwrap();
+        assert_eq!(pages.page_count().unwrap(), 3);
+
+        let hole = pages.read_page(PageId(1)).unwrap();
+        assert!(hole.data().iter().all(|byte| *byte == 0));
+        assert_eq!(pages.read_page(PageId(2)).unwrap().data()[0], 7);
+        drop(pages);
+
+        let mut pages = PageManager::open(db.path()).unwrap();
+        assert_eq!(pages.page_count().unwrap(), 3);
+        assert_eq!(pages.read_page(PageId(2)).unwrap().data()[0], 7);
     }
 
     fn error_of<T>(result: std::io::Result<T>) -> std::io::Error {

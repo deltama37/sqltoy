@@ -54,14 +54,18 @@ impl Database {
     ///
     /// An unknown table is [`ErrorKind::NotFound`] (`table not found: {name}`).
     /// A bad column, value, or expression is [`ErrorKind::InvalidInput`].
+    ///
+    /// The buffer pool is flushed when the statement returns, including when
+    /// it fails. A flush failure after that error is discarded.
     pub fn execute_statement(&mut self, statement: &Statement) -> io::Result<QueryResult> {
-        match statement {
+        let result = match statement {
             Statement::CreateTable(statement) => self.execute_create(statement),
             Statement::Insert(statement) => self.execute_insert(statement),
             Statement::Select(statement) => self.execute_select(statement),
             Statement::Update(statement) => self.execute_update(statement),
             Statement::Delete(statement) => self.execute_delete(statement),
-        }
+        };
+        self.persist(result)
     }
 
     /// Parses `sql` and runs each statement in order.
@@ -87,7 +91,7 @@ impl Database {
                 primary_key: column.primary_key,
             })
             .collect();
-        self.create_table(&statement.name, &columns)?;
+        self.create_table_unflushed(&statement.name, &columns)?;
         Ok(QueryResult::CreatedTable)
     }
 
@@ -126,7 +130,7 @@ impl Database {
             let values = align_values(schema.columns.len(), targets.as_deref(), evaluated);
             pending.push(values);
         }
-        let inserted = self.insert_all(&schema.name, &pending)?;
+        let inserted = self.insert_all_unflushed(&schema.name, &pending)?;
         Ok(QueryResult::Inserted(inserted.len() as u64))
     }
 
@@ -156,7 +160,7 @@ impl Database {
             }
             pending.push((*id, new_values));
         }
-        let updated = self.apply_update(&schema.name, &pending)?;
+        let updated = self.apply_update_unflushed(&schema.name, &pending)?;
         Ok(QueryResult::Updated(updated.len() as u64))
     }
 
@@ -171,7 +175,7 @@ impl Database {
             ids.push(*id);
         }
         for id in &ids {
-            self.delete(&schema.name, *id)?;
+            self.delete_unflushed(&schema.name, *id)?;
         }
         Ok(QueryResult::Deleted(ids.len() as u64))
     }

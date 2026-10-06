@@ -23,8 +23,15 @@ impl Database {
     /// An unknown table is [`ErrorKind::NotFound`]. A count mismatch, a type
     /// mismatch, a NULL primary key, a duplicate primary key, or a row longer
     /// than the maximum record length is [`ErrorKind::InvalidInput`].
+    ///
+    /// The buffer pool is flushed before this returns.
     pub fn insert(&mut self, table: &str, values: &[Value]) -> io::Result<RecordId> {
-        let mut ids = self.insert_all(table, &[values.to_vec()])?;
+        let result = self.insert_unflushed(table, values);
+        self.persist(result)
+    }
+
+    fn insert_unflushed(&mut self, table: &str, values: &[Value]) -> io::Result<RecordId> {
+        let mut ids = self.insert_all_unflushed(table, &[values.to_vec()])?;
         Ok(ids.remove(0))
     }
 
@@ -32,8 +39,21 @@ impl Database {
     ///
     /// Every row is encoded and, when the table has a primary key, checked
     /// against the index and against the other rows before the first write.
-    /// The error cases match [`Self::insert`].
+    /// The error cases match [`Self::insert`]. The buffer pool is flushed
+    /// before this returns.
     pub fn insert_all(&mut self, table: &str, rows: &[Vec<Value>]) -> io::Result<Vec<RecordId>> {
+        let result = self.insert_all_unflushed(table, rows);
+        self.persist(result)
+    }
+
+    /// Inserts every row without flushing.
+    ///
+    /// [`Self::execute_statement`] flushes once after the statement.
+    pub(crate) fn insert_all_unflushed(
+        &mut self,
+        table: &str,
+        rows: &[Vec<Value>],
+    ) -> io::Result<Vec<RecordId>> {
         let schema = self.require_table(table)?;
         let mut encoded = Vec::with_capacity(rows.len());
         let mut keys = Vec::with_capacity(rows.len());
@@ -96,7 +116,19 @@ impl Database {
     /// mismatch, a type mismatch, a NULL primary key, a duplicate primary
     /// key, or a row longer than the maximum record length is
     /// [`ErrorKind::InvalidInput`].
+    ///
+    /// The buffer pool is flushed before this returns.
     pub fn update(&mut self, table: &str, id: RecordId, values: &[Value]) -> io::Result<RecordId> {
+        let result = self.update_unflushed(table, id, values);
+        self.persist(result)
+    }
+
+    fn update_unflushed(
+        &mut self,
+        table: &str,
+        id: RecordId,
+        values: &[Value],
+    ) -> io::Result<RecordId> {
         let schema = self.require_table(table)?;
         let bytes = encode_row(&schema, values)?;
         let new_key = primary_key_value(&schema, values)?;
@@ -133,7 +165,20 @@ impl Database {
     /// lets `id = id + 1` succeed. A duplicate or NULL key writes nothing.
     ///
     /// Returns the record id of each row after the write, in `pending` order.
+    /// The buffer pool is flushed before this returns.
     pub fn apply_update(
+        &mut self,
+        table: &str,
+        pending: &[(RecordId, Vec<Value>)],
+    ) -> io::Result<Vec<RecordId>> {
+        let result = self.apply_update_unflushed(table, pending);
+        self.persist(result)
+    }
+
+    /// Applies `pending` without flushing.
+    ///
+    /// [`Self::execute_statement`] flushes once after the statement.
+    pub(crate) fn apply_update_unflushed(
         &mut self,
         table: &str,
         pending: &[(RecordId, Vec<Value>)],
@@ -194,7 +239,18 @@ impl Database {
     ///
     /// An unknown table or a missing row is [`ErrorKind::NotFound`]. When the
     /// table has a primary key, the key is removed after the row.
+    ///
+    /// The buffer pool is flushed before this returns.
     pub fn delete(&mut self, table: &str, id: RecordId) -> io::Result<()> {
+        let result = self.delete_unflushed(table, id);
+        self.persist(result)
+    }
+
+    /// Deletes one row without flushing.
+    ///
+    /// [`Self::execute_statement`] flushes once after the statement, not after
+    /// each row.
+    pub(crate) fn delete_unflushed(&mut self, table: &str, id: RecordId) -> io::Result<()> {
         let schema = self.require_table(table)?;
         let key = if schema.primary_key.is_some() {
             primary_key_value(&schema, &self.read_row(&schema, id)?)?

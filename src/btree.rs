@@ -3,12 +3,13 @@
 //! Each node is one page. The root page id never changes: splitting the root
 //! allocates two pages, moves the old contents there, and rewrites the root
 //! as an internal node with one separator. Deletes remove a leaf entry and
-//! do not merge or redistribute. Node writes are not synced individually;
-//! [`BTree::insert`] and [`BTree::delete`] sync once at the end.
+//! do not merge or redistribute. Node writes stay in the buffer pool until
+//! the caller flushes. Insert and delete do not sync the file.
 
 use std::io::{self, ErrorKind};
 
-use crate::page::{Page, PageId, PageManager, PAGE_SIZE};
+use crate::buffer::BufferPool;
+use crate::page::{Page, PageId, PAGE_SIZE};
 use crate::record::{RecordId, TableId};
 
 /// Page type byte of a B+Tree node.
@@ -66,11 +67,11 @@ struct Split {
 impl BTree {
     /// Allocates an empty leaf and returns its page id.
     ///
-    /// That id stays the root for the life of the index. The new page is synced.
-    pub fn create(pages: &mut PageManager, owner: TableId) -> io::Result<PageId> {
-        let id = pages.allocate_uncommitted()?;
+    /// That id stays the root for the life of the index. The new page is dirty
+    /// until the caller flushes the buffer pool.
+    pub fn create(pages: &mut BufferPool, owner: TableId) -> io::Result<PageId> {
+        let id = pages.allocate_page()?;
         write_leaf(pages, id, owner, PageId(0), &[])?;
-        pages.sync()?;
         Ok(id)
     }
 
@@ -115,7 +116,7 @@ impl BTree {
     ///
     /// `Ok(None)` when the key is absent. A page that is not a node of this
     /// index is [`ErrorKind::InvalidData`] (`invalid index page: {page_id}`).
-    pub fn get(&self, pages: &mut PageManager, key: i64) -> io::Result<Option<RecordId>> {
+    pub fn get(&self, pages: &mut BufferPool, key: i64) -> io::Result<Option<RecordId>> {
         let mut page_id = self.root;
         let limit = pages.page_count()?;
         for _ in 0..limit {
@@ -135,18 +136,18 @@ impl BTree {
     ///
     /// A duplicate key is [`ErrorKind::InvalidInput`]
     /// (`duplicate primary key: {key}`) and the tree is not modified.
-    /// The file is synced once after a successful insert.
-    pub fn insert(&self, pages: &mut PageManager, key: i64, rid: RecordId) -> io::Result<()> {
+    /// The new entry stays dirty until the caller flushes.
+    pub fn insert(&self, pages: &mut BufferPool, key: i64, rid: RecordId) -> io::Result<()> {
         self.insert_node(pages, self.root, key, rid)?;
-        pages.sync()
+        Ok(())
     }
 
     /// Removes `key` from its leaf.
     ///
     /// Returns `Ok(true)` when an entry was removed and `Ok(false)` when the
-    /// key was absent. Absent keys do not write. A removal syncs once. Empty
-    /// leaves stay in the tree.
-    pub fn delete(&self, pages: &mut PageManager, key: i64) -> io::Result<bool> {
+    /// key was absent. Absent keys do not write. A removal stays dirty until
+    /// the caller flushes. Empty leaves stay in the tree.
+    pub fn delete(&self, pages: &mut BufferPool, key: i64) -> io::Result<bool> {
         let leaf_id = self.find_leaf_page(pages, key)?;
         let Node::Leaf { next, mut entries } = read_node(pages, leaf_id, self.owner)? else {
             return Err(invalid_index_page(leaf_id));
@@ -156,12 +157,11 @@ impl BTree {
         };
         entries.remove(index);
         write_leaf(pages, leaf_id, self.owner, next, &entries)?;
-        pages.sync()?;
         Ok(true)
     }
 
     /// Every live key, in ascending order, by walking the leaf chain.
-    pub fn scan_all(&self, pages: &mut PageManager) -> io::Result<Vec<(i64, RecordId)>> {
+    pub fn scan_all(&self, pages: &mut BufferPool) -> io::Result<Vec<(i64, RecordId)>> {
         let mut page_id = self.leftmost_leaf(pages)?;
         let limit = pages.page_count()?;
         let mut rows = Vec::new();
@@ -183,7 +183,7 @@ impl BTree {
     }
 
     /// Number of levels. A root that is a leaf has height 1.
-    pub fn height(&self, pages: &mut PageManager) -> io::Result<u32> {
+    pub fn height(&self, pages: &mut BufferPool) -> io::Result<u32> {
         let mut page_id = self.root;
         let limit = pages.page_count()?;
         for level in 1..=limit {
@@ -197,7 +197,7 @@ impl BTree {
 
     fn insert_node(
         &self,
-        pages: &mut PageManager,
+        pages: &mut BufferPool,
         page_id: PageId,
         key: i64,
         rid: RecordId,
@@ -218,7 +218,7 @@ impl BTree {
                     self.split_root_leaf(pages, next, &left, &right, separator)?;
                     Ok(None)
                 } else {
-                    let right_id = pages.allocate_uncommitted()?;
+                    let right_id = pages.allocate_page()?;
                     write_leaf(pages, right_id, self.owner, next, &right)?;
                     write_leaf(pages, page_id, self.owner, right_id, &left)?;
                     Ok(Some(Split {
@@ -261,7 +261,7 @@ impl BTree {
                     )?;
                     Ok(None)
                 } else {
-                    let right_id = pages.allocate_uncommitted()?;
+                    let right_id = pages.allocate_page()?;
                     write_internal(pages, right_id, self.owner, right_leftmost, &right_entries)?;
                     write_internal(pages, page_id, self.owner, leftmost, &entries)?;
                     Ok(Some(Split {
@@ -275,14 +275,14 @@ impl BTree {
 
     fn split_root_leaf(
         &self,
-        pages: &mut PageManager,
+        pages: &mut BufferPool,
         old_next: PageId,
         left: &[LeafEntry],
         right: &[LeafEntry],
         separator: i64,
     ) -> io::Result<()> {
-        let left_id = pages.allocate_uncommitted()?;
-        let right_id = pages.allocate_uncommitted()?;
+        let left_id = pages.allocate_page()?;
+        let right_id = pages.allocate_page()?;
         write_leaf(pages, left_id, self.owner, right_id, left)?;
         write_leaf(pages, right_id, self.owner, old_next, right)?;
         let entries = [InternalEntry {
@@ -294,15 +294,15 @@ impl BTree {
 
     fn split_root_internal(
         &self,
-        pages: &mut PageManager,
+        pages: &mut BufferPool,
         left_leftmost: PageId,
         left_entries: &[InternalEntry],
         promoted: i64,
         right_leftmost: PageId,
         right_entries: &[InternalEntry],
     ) -> io::Result<()> {
-        let left_id = pages.allocate_uncommitted()?;
-        let right_id = pages.allocate_uncommitted()?;
+        let left_id = pages.allocate_page()?;
+        let right_id = pages.allocate_page()?;
         write_internal(pages, left_id, self.owner, left_leftmost, left_entries)?;
         write_internal(pages, right_id, self.owner, right_leftmost, right_entries)?;
         let entries = [InternalEntry {
@@ -312,7 +312,7 @@ impl BTree {
         write_internal(pages, self.root, self.owner, left_id, &entries)
     }
 
-    fn find_leaf_page(&self, pages: &mut PageManager, key: i64) -> io::Result<PageId> {
+    fn find_leaf_page(&self, pages: &mut BufferPool, key: i64) -> io::Result<PageId> {
         let mut page_id = self.root;
         let limit = pages.page_count()?;
         for _ in 0..limit {
@@ -326,7 +326,7 @@ impl BTree {
         Err(invalid_index_page(page_id))
     }
 
-    fn leftmost_leaf(&self, pages: &mut PageManager) -> io::Result<PageId> {
+    fn leftmost_leaf(&self, pages: &mut BufferPool) -> io::Result<PageId> {
         let mut page_id = self.root;
         let limit = pages.page_count()?;
         for _ in 0..limit {
@@ -369,7 +369,7 @@ fn child_for(leftmost: PageId, entries: &[InternalEntry], key: i64) -> PageId {
     }
 }
 
-fn read_node(pages: &mut PageManager, page_id: PageId, owner: TableId) -> io::Result<Node> {
+fn read_node(pages: &mut BufferPool, page_id: PageId, owner: TableId) -> io::Result<Node> {
     let page = pages.read_page(page_id)?;
     parse_node(page_id, owner, page.data())
 }
@@ -440,7 +440,7 @@ fn parse_node(page_id: PageId, owner: TableId, data: &[u8]) -> io::Result<Node> 
 }
 
 fn write_leaf(
-    pages: &mut PageManager,
+    pages: &mut BufferPool,
     page_id: PageId,
     owner: TableId,
     next: PageId,
@@ -460,7 +460,7 @@ fn write_leaf(
 }
 
 fn write_internal(
-    pages: &mut PageManager,
+    pages: &mut BufferPool,
     page_id: PageId,
     owner: TableId,
     leftmost: PageId,
@@ -537,7 +537,8 @@ fn invalid_index_page(page_id: PageId) -> io::Error {
 #[cfg(test)]
 mod tests {
     use super::{BTree, INTERNAL_CAPACITY, LEAF_CAPACITY};
-    use crate::page::{PageId, PageManager};
+    use crate::buffer::BufferPool;
+    use crate::page::PageId;
     use crate::record::{RecordId, TableId};
     use std::collections::BTreeMap;
     use std::env::temp_dir;
@@ -583,9 +584,9 @@ mod tests {
         }
     }
 
-    fn fresh(label: &str) -> (TempDb, PageManager, PageId) {
+    fn fresh(label: &str) -> (TempDb, BufferPool, PageId) {
         let db = TempDb::new(label);
-        let mut pages = PageManager::open(db.path()).unwrap();
+        let mut pages = BufferPool::open(db.path(), 8).unwrap();
         let root = BTree::create(&mut pages, OWNER).unwrap();
         (db, pages, root)
     }
@@ -788,7 +789,7 @@ mod tests {
         let db = TempDb::new("persist");
         let root;
         {
-            let mut pages = PageManager::open(db.path()).unwrap();
+            let mut pages = BufferPool::open(db.path(), 8).unwrap();
             root = BTree::create(&mut pages, OWNER).unwrap();
             let tree = BTree::open(root, OWNER);
             for key in 0..300 {
@@ -798,8 +799,9 @@ mod tests {
             tree.insert(&mut pages, -5, rid(7, 1)).unwrap();
             assert!(tree.height(&mut pages).unwrap() >= 2);
             assert_eq!(tree.root(), root);
+            pages.flush().unwrap();
         }
-        let mut pages = PageManager::open(db.path()).unwrap();
+        let mut pages = BufferPool::open(db.path(), 8).unwrap();
         let tree = BTree::open(root, OWNER);
         assert_eq!(tree.root(), root);
         assert!(tree.height(&mut pages).unwrap() >= 2);
