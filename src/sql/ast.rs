@@ -40,6 +40,8 @@ pub struct ColumnDef {
     pub name: String,
     /// `INTEGER` or `TEXT`.
     pub column_type: ColumnType,
+    /// `true` when the definition ends with `PRIMARY KEY`.
+    pub primary_key: bool,
 }
 
 /// `INSERT INTO table [(columns)] VALUES (...), ...`.
@@ -226,7 +228,11 @@ impl fmt::Display for CreateTable {
 
 impl fmt::Display for ColumnDef {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        write!(f, "{} {}", self.name, self.column_type)
+        write!(f, "{} {}", self.name, self.column_type)?;
+        if self.primary_key {
+            write!(f, " PRIMARY KEY")?;
+        }
+        Ok(())
     }
 }
 

@@ -10,6 +10,7 @@ use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::btree::PAGE_TYPE_BTREE;
 use crate::page::{PageId, PageManager};
 use crate::slotted_page::SlottedPage;
 
@@ -87,9 +88,9 @@ impl RecordFile {
 
     /// Inserts `record` on the first page owned by `table` that can hold it.
     ///
-    /// Scans from page 1 and skips pages owned by other tables. When no owned
-    /// page has room, a new record page is allocated and initialized for
-    /// `table`. A record longer than [`MAX_RECORD_SIZE`] is
+    /// Scans from page 1 and skips pages owned by other tables and B+Tree
+    /// nodes. When no owned page has room, a new record page is allocated and
+    /// initialized for `table`. A record longer than [`MAX_RECORD_SIZE`] is
     /// [`ErrorKind::InvalidInput`]. [`TableId`] `0` is [`ErrorKind::InvalidInput`].
     pub fn insert(&mut self, table: TableId, record: &[u8]) -> io::Result<RecordId> {
         require_table(table)?;
@@ -99,8 +100,9 @@ impl RecordFile {
         let count = self.pages.page_count()?;
         for raw_id in 1..count {
             let page_id = PageId(raw_id);
-            let page = self.pages.read_page(page_id)?;
-            let mut slotted = SlottedPage::from_page(page_id, page)?;
+            let Some(mut slotted) = self.read_record_page_or_skip(page_id)? else {
+                continue;
+            };
             if slotted.owner() != table {
                 continue;
             }
@@ -123,8 +125,8 @@ impl RecordFile {
 
     /// Reads the live record identified by `id` on `table`.
     ///
-    /// An out-of-range page, page 0, a page owned by another table, an
-    /// out-of-range slot, or a tombstone is [`ErrorKind::NotFound`].
+    /// An out-of-range page, page 0, a B+Tree node, a page owned by another
+    /// table, an out-of-range slot, or a tombstone is [`ErrorKind::NotFound`].
     /// [`TableId`] `0` is [`ErrorKind::InvalidInput`].
     pub fn get(&mut self, table: TableId, id: RecordId) -> io::Result<Vec<u8>> {
         require_table(table)?;
@@ -210,8 +212,9 @@ impl RecordFile {
         let mut records = Vec::new();
         for raw_id in 1..count {
             let page_id = PageId(raw_id);
-            let page = self.pages.read_page(page_id)?;
-            let slotted = SlottedPage::from_page(page_id, page)?;
+            let Some(slotted) = self.read_record_page_or_skip(page_id)? else {
+                continue;
+            };
             if slotted.owner() != table {
                 continue;
             }
@@ -239,7 +242,29 @@ impl RecordFile {
             return Err(not_found(id));
         }
         let page = self.pages.read_page(id.page_id)?;
+        if page.data().first().copied() == Some(PAGE_TYPE_BTREE) {
+            return Err(not_found(id));
+        }
         SlottedPage::from_page(id.page_id, page)
+    }
+
+    /// `Ok(None)` for a B+Tree node. Any other non-record page is an error.
+    fn read_record_page_or_skip(&mut self, page_id: PageId) -> io::Result<Option<SlottedPage>> {
+        let page = self.pages.read_page(page_id)?;
+        if page.data().first().copied() == Some(PAGE_TYPE_BTREE) {
+            return Ok(None);
+        }
+        Ok(Some(SlottedPage::from_page(page_id, page)?))
+    }
+
+    /// Pages read since this file was opened.
+    pub fn pages_read(&self) -> u64 {
+        self.pages.pages_read()
+    }
+
+    /// Page manager, so the index can share this file.
+    pub(crate) fn pages_mut(&mut self) -> &mut PageManager {
+        &mut self.pages
     }
 
     fn store(&mut self, page_id: PageId, slotted: &SlottedPage) -> io::Result<()> {
@@ -505,7 +530,7 @@ mod tests {
     }
 
     #[test]
-    fn format_version_is_two() {
+    fn format_version_is_three() {
         let db = TempDb::new("version");
         {
             let mut file = RecordFile::open(db.path()).unwrap();
@@ -521,7 +546,7 @@ mod tests {
             .unwrap();
         }
         let mut pages = PageManager::open(db.path()).unwrap();
-        assert_eq!(pages.format_version().unwrap(), 2);
+        assert_eq!(pages.format_version().unwrap(), 3);
         let header = pages.read_page(PageId(0)).unwrap();
         assert_eq!(&header.data()[..8], b"SQLTOYDB");
     }
@@ -617,5 +642,34 @@ mod tests {
 
         let stored = file.insert(TableId(2), b"ok").unwrap();
         assert_eq!(stored.to_string(), "1:0");
+    }
+
+    #[test]
+    fn btree_pages_are_skipped_and_are_not_records() {
+        use crate::btree::BTree;
+
+        let db = TempDb::new("btreeskip");
+        let mut file = RecordFile::open(db.path()).unwrap();
+        let root = BTree::create(file.pages_mut(), TABLE).unwrap();
+        let id = file.insert(TABLE, b"row").unwrap();
+        assert_ne!(id.page_id, root);
+        assert_eq!(file.scan(TABLE).unwrap(), vec![(id, b"row".to_vec())]);
+
+        let index_rid = RecordId {
+            page_id: root,
+            slot_id: 0,
+        };
+        for op in ["get", "update", "delete"] {
+            let err = match op {
+                "get" => file.get(TABLE, index_rid).unwrap_err(),
+                "update" => file.update(TABLE, index_rid, b"nope").unwrap_err(),
+                "delete" => file.delete(TABLE, index_rid).unwrap_err(),
+                _ => unreachable!(),
+            };
+            assert_eq!(err.kind(), ErrorKind::NotFound, "{op}");
+            assert_eq!(err.to_string(), format!("record not found: {index_rid}"));
+        }
+        assert_eq!(file.get(TABLE, id).unwrap(), b"row");
+        assert!(file.pages_read() > 0);
     }
 }

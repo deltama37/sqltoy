@@ -8,6 +8,8 @@ use std::io::{self, ErrorKind};
 use std::path::Path;
 use std::str::FromStr;
 
+use crate::btree::BTree;
+use crate::page::PageId;
 use crate::record::{RecordFile, RecordId, TableId, MAX_RECORD_SIZE};
 
 /// SQL column type stored in the catalog.
@@ -74,6 +76,28 @@ pub struct Column {
     pub column_type: ColumnType,
 }
 
+/// One column passed to [`Database::create_table`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ColumnSpec<'a> {
+    /// Column name.
+    pub name: &'a str,
+    /// Column type.
+    pub column_type: ColumnType,
+    /// Whether this column is the table's primary key.
+    pub primary_key: bool,
+}
+
+impl<'a> ColumnSpec<'a> {
+    /// A column that is not a primary key.
+    pub const fn new(name: &'a str, column_type: ColumnType) -> ColumnSpec<'a> {
+        ColumnSpec {
+            name,
+            column_type,
+            primary_key: false,
+        }
+    }
+}
+
 /// Name and columns of one user table.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TableSchema {
@@ -83,6 +107,10 @@ pub struct TableSchema {
     pub name: String,
     /// Columns in definition order.
     pub columns: Vec<Column>,
+    /// Index of the primary-key column, when the table has one.
+    pub primary_key: Option<usize>,
+    /// Root page of the primary-key index, when the table has one.
+    pub index_root: Option<PageId>,
 }
 
 /// An open database file and the schemas loaded from its catalog.
@@ -126,12 +154,16 @@ impl Database {
     /// case; the stored spelling is the one passed in.
     ///
     /// An empty column list, a bad identifier, a duplicate table or column
-    /// name, a definition longer than [`MAX_RECORD_SIZE`], or an id that
-    /// would not fit in `u16` is [`ErrorKind::InvalidInput`].
+    /// name, more than one primary key, a non-`INTEGER` primary key, a
+    /// definition longer than [`MAX_RECORD_SIZE`], or an id that would not
+    /// fit in `u16` is [`ErrorKind::InvalidInput`].
+    ///
+    /// A primary key allocates an empty B+Tree leaf before the catalog record
+    /// is written. Tables without a primary key have no index.
     pub fn create_table(
         &mut self,
         name: &str,
-        columns: &[(&str, ColumnType)],
+        columns: &[ColumnSpec<'_>],
     ) -> io::Result<&TableSchema> {
         check_identifier(name)?;
         if columns.is_empty() {
@@ -141,20 +173,36 @@ impl Database {
             ));
         }
         let mut defined = Vec::with_capacity(columns.len());
-        for &(column_name, column_type) in columns {
-            check_identifier(column_name)?;
+        let mut primary_key = None;
+        for column in columns {
+            check_identifier(column.name)?;
             if defined
                 .iter()
-                .any(|column: &Column| names_eq(&column.name, column_name))
+                .any(|existing: &Column| names_eq(&existing.name, column.name))
             {
                 return Err(io::Error::new(
                     ErrorKind::InvalidInput,
-                    format!("duplicate column: {column_name}"),
+                    format!("duplicate column: {}", column.name),
                 ));
             }
+            if column.primary_key {
+                if primary_key.is_some() {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("multiple primary keys for table {name}"),
+                    ));
+                }
+                if column.column_type != ColumnType::Integer {
+                    return Err(io::Error::new(
+                        ErrorKind::InvalidInput,
+                        format!("primary key must be INTEGER: {}", column.name),
+                    ));
+                }
+                primary_key = Some(defined.len());
+            }
             defined.push(Column {
-                name: column_name.to_string(),
-                column_type,
+                name: column.name.to_string(),
+                column_type: column.column_type,
             });
         }
         if self.tables.iter().any(|table| names_eq(&table.name, name)) {
@@ -164,15 +212,27 @@ impl Database {
             ));
         }
         let id = next_table_id(&self.tables)?;
+        let index_root = if primary_key.is_some() {
+            Some(BTree::create(self.records.pages_mut(), id)?)
+        } else {
+            None
+        };
         let schema = TableSchema {
             id,
             name: name.to_string(),
             columns: defined,
+            primary_key,
+            index_root,
         };
         let bytes = encode_schema(&schema)?;
         self.records.insert(TableId::CATALOG, &bytes)?;
         self.tables.push(schema);
         Ok(&self.tables[self.tables.len() - 1])
+    }
+
+    /// Pages read since this database was opened.
+    pub fn pages_read(&self) -> u64 {
+        self.records.pages_read()
     }
 
     /// Returns the schema named `name`, ignoring ASCII case.
@@ -200,6 +260,13 @@ fn encode_schema(schema: &TableSchema) -> io::Result<Vec<u8>> {
         push_str(&mut bytes, &column.name);
         bytes.push(column.column_type.code());
     }
+    let pk_index = match schema.primary_key {
+        Some(index) => u16::try_from(index).map_err(|_| definition_too_large(&schema.name))?,
+        None => 0xFFFF,
+    };
+    push_u16(&mut bytes, pk_index);
+    let root = schema.index_root.map(|page| page.0).unwrap_or(0);
+    bytes.extend_from_slice(&root.to_le_bytes());
     if bytes.len() > MAX_RECORD_SIZE {
         return Err(definition_too_large(&schema.name));
     }
@@ -227,13 +294,35 @@ fn decode_parts(bytes: &[u8]) -> Option<TableSchema> {
             column_type,
         });
     }
+    let pk_raw = reader.u16()?;
+    let root_raw = reader.u32()?;
     if !reader.is_empty() {
         return None;
+    }
+    let primary_key = if pk_raw == 0xFFFF {
+        None
+    } else {
+        let index = pk_raw as usize;
+        if index >= columns.len() || columns[index].column_type != ColumnType::Integer {
+            return None;
+        }
+        Some(index)
+    };
+    let index_root = if root_raw == 0 {
+        None
+    } else {
+        Some(PageId(root_raw))
+    };
+    match (primary_key, index_root) {
+        (None, None) | (Some(_), Some(_)) => {}
+        _ => return None,
     }
     Some(TableSchema {
         id: TableId(table_id),
         name,
         columns,
+        primary_key,
+        index_root,
     })
 }
 
@@ -264,6 +353,11 @@ impl<'a> Reader<'a> {
     fn u16(&mut self) -> Option<u16> {
         self.take(2)
             .map(|bytes| u16::from_le_bytes([bytes[0], bytes[1]]))
+    }
+
+    fn u32(&mut self) -> Option<u32> {
+        self.take(4)
+            .map(|bytes| u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]))
     }
 
     fn string(&mut self) -> Option<String> {
@@ -351,7 +445,9 @@ fn definition_too_large(name: &str) -> io::Error {
 
 #[cfg(test)]
 mod tests {
-    use super::{decode_catalog_record, encode_schema, Column, ColumnType, Database, TableSchema};
+    use super::{
+        decode_catalog_record, encode_schema, Column, ColumnSpec, ColumnType, Database, TableSchema,
+    };
     use crate::page::PageId;
     use crate::record::{RecordFile, RecordId, TableId};
     use std::env::temp_dir;
@@ -409,6 +505,8 @@ mod tests {
                     column_type: ColumnType::Text,
                 },
             ],
+            primary_key: None,
+            index_root: None,
         }
     }
 
@@ -433,7 +531,7 @@ mod tests {
         let bytes = encode_schema(&schema).unwrap();
         let expected = [
             2, 0, 5, 0, b'u', b's', b'e', b'r', b's', 2, 0, 2, 0, b'i', b'd', 1, 4, 0, b'n', b'a',
-            b'm', b'e', 2,
+            b'm', b'e', 2, 0xff, 0xff, 0, 0, 0, 0,
         ];
         assert_eq!(bytes, expected);
         assert_eq!(decode_catalog_record(sample_rid(), &bytes).unwrap(), schema);
@@ -459,7 +557,9 @@ mod tests {
         cases.push(bad_id_one);
         cases.push(vec![2, 0, 1, 0, 0xff, 0, 0]);
         let mut bad_type = valid.clone();
-        *bad_type.last_mut().unwrap() = 9;
+        // The last column's type byte is immediately before the 6-byte key suffix.
+        let type_at = bad_type.len() - 7;
+        bad_type[type_at] = 9;
         cases.push(bad_type);
         let mut bad_column_utf8 = valid;
         // Table-name length and bytes become a one-byte invalid UTF-8 sequence.
@@ -482,14 +582,20 @@ mod tests {
             let users_id = database
                 .create_table(
                     "users",
-                    &[("id", ColumnType::Integer), ("name", ColumnType::Text)],
+                    &[
+                        ColumnSpec::new("id", ColumnType::Integer),
+                        ColumnSpec::new("name", ColumnType::Text),
+                    ],
                 )
                 .unwrap()
                 .id;
             let posts_id = database
                 .create_table(
                     "posts",
-                    &[("id", ColumnType::Integer), ("title", ColumnType::Text)],
+                    &[
+                        ColumnSpec::new("id", ColumnType::Integer),
+                        ColumnSpec::new("title", ColumnType::Text),
+                    ],
                 )
                 .unwrap()
                 .id;
@@ -503,7 +609,7 @@ mod tests {
             );
             assert!(database.table("user").is_none());
             let err = database
-                .create_table("Users", &[("id", ColumnType::Integer)])
+                .create_table("Users", &[ColumnSpec::new("id", ColumnType::Integer)])
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert_eq!(err.to_string(), "table already exists: Users");
@@ -523,13 +629,13 @@ mod tests {
         let too_long = "a".repeat(65);
         for name in ["", "1abc", "a-b", too_long.as_str(), "has space"] {
             let err = database
-                .create_table(name, &[("id", ColumnType::Integer)])
+                .create_table(name, &[ColumnSpec::new("id", ColumnType::Integer)])
                 .unwrap_err();
             assert_eq!(err.kind(), ErrorKind::InvalidInput);
             assert_eq!(err.to_string(), format!("invalid identifier: {name}"));
         }
         let err = database
-            .create_table("users", &[("1id", ColumnType::Integer)])
+            .create_table("users", &[ColumnSpec::new("1id", ColumnType::Integer)])
             .unwrap_err();
         assert_eq!(err.to_string(), "invalid identifier: 1id");
         let err = database.create_table("users", &[]).unwrap_err();
@@ -538,7 +644,10 @@ mod tests {
         let err = database
             .create_table(
                 "users",
-                &[("id", ColumnType::Integer), ("ID", ColumnType::Text)],
+                &[
+                    ColumnSpec::new("id", ColumnType::Integer),
+                    ColumnSpec::new("ID", ColumnType::Text),
+                ],
             )
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -547,13 +656,13 @@ mod tests {
 
         let long = "a".repeat(64);
         let id = database
-            .create_table(&long, &[("_id", ColumnType::Integer)])
+            .create_table(&long, &[ColumnSpec::new("_id", ColumnType::Integer)])
             .unwrap()
             .id;
         assert_eq!(id, TableId::FIRST_USER);
         assert_eq!(database.table(&long).unwrap().columns[0].name, "_id");
         database
-            .create_table("_t", &[("_c", ColumnType::Text)])
+            .create_table("_t", &[ColumnSpec::new("_c", ColumnType::Text)])
             .unwrap();
         assert_eq!(
             database.table("_T").unwrap().columns[0].column_type,
@@ -568,9 +677,9 @@ mod tests {
         let wide: Vec<(String, ColumnType)> = (0..61)
             .map(|index| (format!("c{index:063}"), ColumnType::Text))
             .collect();
-        let columns: Vec<(&str, ColumnType)> = wide
+        let columns: Vec<ColumnSpec> = wide
             .iter()
-            .map(|(name, column_type)| (name.as_str(), *column_type))
+            .map(|(name, column_type)| ColumnSpec::new(name, *column_type))
             .collect();
         let err = database.create_table("t", &columns).unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
@@ -580,9 +689,9 @@ mod tests {
         let fitting: Vec<(String, ColumnType)> = (0..60)
             .map(|index| (format!("c{index:063}"), ColumnType::Text))
             .collect();
-        let columns: Vec<(&str, ColumnType)> = fitting
+        let columns: Vec<ColumnSpec> = fitting
             .iter()
-            .map(|(name, column_type)| (name.as_str(), *column_type))
+            .map(|(name, column_type)| ColumnSpec::new(name, *column_type))
             .collect();
         assert_eq!(database.create_table("t", &columns).unwrap().id, TableId(2));
     }
@@ -648,7 +757,7 @@ mod tests {
             let mut database = Database::open(db.path()).unwrap();
             assert!(database.tables().is_empty());
             database
-                .create_table("users", &[("id", ColumnType::Integer)])
+                .create_table("users", &[ColumnSpec::new("id", ColumnType::Integer)])
                 .unwrap();
         }
         let database = Database::open(db.path()).unwrap();
@@ -685,7 +794,7 @@ mod tests {
         assert_eq!(database.tables()[0].name, "users");
         assert_eq!(database.tables()[1].id, TableId(4));
         let next = database
-            .create_table("comments", &[("id", ColumnType::Integer)])
+            .create_table("comments", &[ColumnSpec::new("id", ColumnType::Integer)])
             .unwrap()
             .id;
         assert_eq!(next, TableId(5));
@@ -705,11 +814,114 @@ mod tests {
         }
         let mut database = Database::open(db.path()).unwrap();
         let err = database
-            .create_table("another", &[("id", ColumnType::Integer)])
+            .create_table("another", &[ColumnSpec::new("id", ColumnType::Integer)])
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidInput);
         assert_eq!(err.to_string(), "too many tables");
         assert_eq!(database.tables().len(), 1);
+    }
+
+    #[test]
+    fn primary_key_is_stored_and_restored() {
+        let db = TempDb::new("pk");
+        let root;
+        {
+            let mut database = Database::open(db.path()).unwrap();
+            let schema = database
+                .create_table(
+                    "users",
+                    &[
+                        ColumnSpec {
+                            name: "id",
+                            column_type: ColumnType::Integer,
+                            primary_key: true,
+                        },
+                        ColumnSpec::new("name", ColumnType::Text),
+                    ],
+                )
+                .unwrap();
+            assert_eq!(schema.primary_key, Some(0));
+            root = schema.index_root.unwrap();
+            assert_ne!(root, PageId(0));
+            database
+                .create_table("posts", &[ColumnSpec::new("id", ColumnType::Integer)])
+                .unwrap();
+            assert!(database.table("posts").unwrap().primary_key.is_none());
+            assert!(database.table("posts").unwrap().index_root.is_none());
+        }
+        let mut database = Database::open(db.path()).unwrap();
+        let users = database.table("users").unwrap();
+        assert_eq!(users.primary_key, Some(0));
+        assert_eq!(users.index_root, Some(root));
+        let page = database.records.pages_mut().read_page(root).unwrap();
+        assert_eq!(page.data()[0], 2);
+        assert_eq!(page.data()[1], 1);
+        assert_eq!(&page.data()[4..6], &2u16.to_le_bytes());
+
+        let err = database
+            .create_table(
+                "bad",
+                &[
+                    ColumnSpec {
+                        name: "id",
+                        column_type: ColumnType::Integer,
+                        primary_key: true,
+                    },
+                    ColumnSpec {
+                        name: "other",
+                        column_type: ColumnType::Integer,
+                        primary_key: true,
+                    },
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "multiple primary keys for table bad");
+        let err = database
+            .create_table(
+                "names",
+                &[ColumnSpec {
+                    name: "name",
+                    column_type: ColumnType::Text,
+                    primary_key: true,
+                }],
+            )
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "primary key must be INTEGER: name");
+        assert!(database.table("bad").is_none());
+        assert!(database.table("names").is_none());
+    }
+
+    #[test]
+    fn catalog_record_rejects_a_bad_primary_key() {
+        let rid = sample_rid();
+        let mut with_pk = users_schema();
+        with_pk.primary_key = Some(0);
+        with_pk.index_root = Some(PageId(7));
+        let bytes = encode_schema(&with_pk).unwrap();
+        assert_eq!(decode_catalog_record(rid, &bytes).unwrap(), with_pk);
+
+        let mut text_pk = with_pk.clone();
+        text_pk.primary_key = Some(1);
+        let err = decode_catalog_record(rid, &encode_schema(&text_pk).unwrap()).unwrap_err();
+        assert_eq!(err.to_string(), "invalid catalog record: 1:4");
+
+        let mut missing_root = with_pk.clone();
+        missing_root.index_root = None;
+        let err = decode_catalog_record(rid, &encode_schema(&missing_root).unwrap()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
+
+        let mut root_without_pk = users_schema();
+        root_without_pk.index_root = Some(PageId(3));
+        let err =
+            decode_catalog_record(rid, &encode_schema(&root_without_pk).unwrap()).unwrap_err();
+        assert_eq!(err.to_string(), "invalid catalog record: 1:4");
+
+        let mut out_of_range = with_pk.clone();
+        out_of_range.primary_key = Some(5);
+        let err = decode_catalog_record(rid, &encode_schema(&out_of_range).unwrap()).unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidData);
     }
 
     fn error_of<T>(result: std::io::Result<T>) -> std::io::Error {

@@ -2,27 +2,60 @@
 //!
 //! Values are checked against the catalog schema and stored as one record
 //! per row. When an updated row no longer fits on its page, it is inserted
-//! at a new record id and the old row is deleted.
+//! at a new record id and the old row is deleted. A primary key is kept in
+//! the table's B+Tree: it cannot be NULL, and it is unique.
 
+use std::collections::BTreeSet;
 use std::io::{self, ErrorKind};
 
+use crate::btree::BTree;
 use crate::catalog::{Database, TableSchema};
-use crate::record::RecordId;
+use crate::record::{RecordId, TableId};
 use crate::row::{decode_row, encode_row, Value};
 
 impl Database {
     /// Inserts one row into `table` and returns its record id.
     ///
     /// `values` must match the column count and types. NULL is allowed in
-    /// every column. Comparison of `table` ignores ASCII case.
+    /// every column except a primary key. Comparison of `table` ignores ASCII
+    /// case. A duplicate primary key is rejected before the row is written.
     ///
     /// An unknown table is [`ErrorKind::NotFound`]. A count mismatch, a type
-    /// mismatch, or a row longer than the maximum record length is
-    /// [`ErrorKind::InvalidInput`].
+    /// mismatch, a NULL primary key, a duplicate primary key, or a row longer
+    /// than the maximum record length is [`ErrorKind::InvalidInput`].
     pub fn insert(&mut self, table: &str, values: &[Value]) -> io::Result<RecordId> {
+        let mut ids = self.insert_all(table, &[values.to_vec()])?;
+        Ok(ids.remove(0))
+    }
+
+    /// Inserts every row, or none of them.
+    ///
+    /// Every row is encoded and, when the table has a primary key, checked
+    /// against the index and against the other rows before the first write.
+    /// The error cases match [`Self::insert`].
+    pub fn insert_all(&mut self, table: &str, rows: &[Vec<Value>]) -> io::Result<Vec<RecordId>> {
         let schema = self.require_table(table)?;
-        let bytes = encode_row(&schema, values)?;
-        self.records.insert(schema.id, &bytes)
+        let mut encoded = Vec::with_capacity(rows.len());
+        let mut keys = Vec::with_capacity(rows.len());
+        for values in rows {
+            encoded.push(encode_row(&schema, values)?);
+            keys.push(primary_key_value(&schema, values)?);
+        }
+        let mut seen = BTreeSet::new();
+        for key in keys.iter().flatten() {
+            if !seen.insert(*key) || self.index_contains(&schema, *key)? {
+                return Err(duplicate_key(*key));
+            }
+        }
+        let mut ids = Vec::with_capacity(encoded.len());
+        for (bytes, key) in encoded.iter().zip(&keys) {
+            let id = self.records.insert(schema.id, bytes)?;
+            if let Some(key) = key {
+                self.index_insert(&schema, *key, id)?;
+            }
+            ids.push(id);
+        }
+        Ok(ids)
     }
 
     /// Reads the row identified by `id` in `table`.
@@ -49,33 +82,182 @@ impl Database {
 
     /// Replaces the row identified by `id`.
     ///
-    /// The checks match [`Self::insert`] and run before the record is read.
+    /// The checks match [`Self::insert`] and run before the row is replaced.
     /// When the new bytes fit on the same page, the record id is unchanged.
     /// When they do not, the new row is inserted and the old row is deleted
     /// afterward, and the new id is returned. A crash between those writes
     /// can leave both copies.
     ///
+    /// If the primary key or the record id changes, the old index entry is
+    /// removed and the new key is inserted. A duplicate of another row's key
+    /// is rejected before either write.
+    ///
     /// An unknown table or a missing row is [`ErrorKind::NotFound`]. A count
-    /// mismatch, a type mismatch, or a row longer than the maximum record
-    /// length is [`ErrorKind::InvalidInput`].
+    /// mismatch, a type mismatch, a NULL primary key, a duplicate primary
+    /// key, or a row longer than the maximum record length is
+    /// [`ErrorKind::InvalidInput`].
     pub fn update(&mut self, table: &str, id: RecordId, values: &[Value]) -> io::Result<RecordId> {
         let schema = self.require_table(table)?;
         let bytes = encode_row(&schema, values)?;
-        if self.records.try_update(schema.id, id, &bytes)? {
-            Ok(id)
+        let new_key = primary_key_value(&schema, values)?;
+        let old_key = if let Some(index) = schema.primary_key {
+            Some(require_primary_key(
+                &schema,
+                &self.read_row(&schema, id)?,
+                index,
+            )?)
         } else {
-            let new_id = self.records.insert(schema.id, &bytes)?;
-            self.records.delete(schema.id, id)?;
-            Ok(new_id)
+            None
+        };
+        if let (Some(new_key), Some(old_key)) = (new_key, old_key) {
+            if new_key != old_key && self.index_contains(&schema, new_key)? {
+                return Err(duplicate_key(new_key));
+            }
         }
+        let new_id = self.write_row(schema.id, id, &bytes)?;
+        if let (Some(new_key), Some(old_key)) = (new_key, old_key) {
+            if new_id != id || new_key != old_key {
+                self.index_delete(&schema, old_key)?;
+                self.index_insert(&schema, new_key, new_id)?;
+            }
+        }
+        Ok(new_id)
+    }
+
+    /// Applies `pending` updates, or none of them.
+    ///
+    /// Every new row is encoded first. When the table has a primary key, the
+    /// keys of rows that are not in `pending`, plus the new keys, must be
+    /// unique. Old keys of the updated rows are then removed from the index,
+    /// and each row is written and inserted under its new key. That order
+    /// lets `id = id + 1` succeed. A duplicate or NULL key writes nothing.
+    ///
+    /// Returns the record id of each row after the write, in `pending` order.
+    pub fn apply_update(
+        &mut self,
+        table: &str,
+        pending: &[(RecordId, Vec<Value>)],
+    ) -> io::Result<Vec<RecordId>> {
+        let schema = self.require_table(table)?;
+        if pending.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut encoded = Vec::with_capacity(pending.len());
+        for (_, values) in pending {
+            encoded.push(encode_row(&schema, values)?);
+        }
+        if schema.primary_key.is_none() {
+            let mut ids = Vec::with_capacity(pending.len());
+            for (index, (id, _)) in pending.iter().enumerate() {
+                ids.push(self.write_row(schema.id, *id, &encoded[index])?);
+            }
+            return Ok(ids);
+        }
+
+        let index = schema.primary_key.expect("primary key checked above");
+        let mut new_keys = Vec::with_capacity(pending.len());
+        for (_, values) in pending {
+            new_keys.push(require_primary_key(&schema, values, index)?);
+        }
+        let mut old_keys = Vec::with_capacity(pending.len());
+        for (id, _) in pending {
+            let old = self.read_row(&schema, *id)?;
+            old_keys.push(require_primary_key(&schema, &old, index)?);
+        }
+        self.ensure_updated_keys_unique(&schema, &old_keys, &new_keys)?;
+
+        for key in &old_keys {
+            self.index_delete(&schema, *key)?;
+        }
+        let mut ids = Vec::with_capacity(pending.len());
+        for (index, (id, _)) in pending.iter().enumerate() {
+            let new_id = self.write_row(schema.id, *id, &encoded[index])?;
+            self.index_insert(&schema, new_keys[index], new_id)?;
+            ids.push(new_id);
+        }
+        Ok(ids)
+    }
+
+    /// Levels in `table`'s primary-key index.
+    ///
+    /// `Ok(None)` when the table has no primary key. A root leaf has height 1.
+    pub fn index_height(&mut self, table: &str) -> io::Result<Option<u32>> {
+        let schema = self.require_table(table)?;
+        let Some(root) = schema.index_root else {
+            return Ok(None);
+        };
+        let tree = BTree::open(root, schema.id);
+        Ok(Some(tree.height(self.records.pages_mut())?))
     }
 
     /// Deletes the row identified by `id` in `table`.
     ///
-    /// An unknown table or a missing row is [`ErrorKind::NotFound`].
+    /// An unknown table or a missing row is [`ErrorKind::NotFound`]. When the
+    /// table has a primary key, the key is removed after the row.
     pub fn delete(&mut self, table: &str, id: RecordId) -> io::Result<()> {
         let schema = self.require_table(table)?;
-        self.records.delete(schema.id, id)
+        let key = if schema.primary_key.is_some() {
+            primary_key_value(&schema, &self.read_row(&schema, id)?)?
+        } else {
+            None
+        };
+        self.records.delete(schema.id, id)?;
+        if let Some(key) = key {
+            self.index_delete(&schema, key)?;
+        }
+        Ok(())
+    }
+
+    fn read_row(&mut self, schema: &TableSchema, id: RecordId) -> io::Result<Vec<Value>> {
+        let bytes = self.records.get(schema.id, id)?;
+        decode_row(schema, id, &bytes)
+    }
+
+    fn write_row(&mut self, table: TableId, id: RecordId, bytes: &[u8]) -> io::Result<RecordId> {
+        if self.records.try_update(table, id, bytes)? {
+            Ok(id)
+        } else {
+            let new_id = self.records.insert(table, bytes)?;
+            self.records.delete(table, id)?;
+            Ok(new_id)
+        }
+    }
+
+    fn ensure_updated_keys_unique(
+        &mut self,
+        schema: &TableSchema,
+        old_keys: &[i64],
+        new_keys: &[i64],
+    ) -> io::Result<()> {
+        // Keys of the updated rows are removed before the new keys go in, so
+        // only an indexed key that belongs to a row outside the update conflicts.
+        let released: BTreeSet<i64> = old_keys.iter().copied().collect();
+        let mut claimed = BTreeSet::new();
+        for &key in new_keys {
+            if !claimed.insert(key) {
+                return Err(duplicate_key(key));
+            }
+            if !released.contains(&key) && self.index_contains(schema, key)? {
+                return Err(duplicate_key(key));
+            }
+        }
+        Ok(())
+    }
+
+    fn index_contains(&mut self, schema: &TableSchema, key: i64) -> io::Result<bool> {
+        let tree = open_index(schema)?;
+        Ok(tree.get(self.records.pages_mut(), key)?.is_some())
+    }
+
+    fn index_insert(&mut self, schema: &TableSchema, key: i64, id: RecordId) -> io::Result<()> {
+        let tree = open_index(schema)?;
+        tree.insert(self.records.pages_mut(), key, id)
+    }
+
+    fn index_delete(&mut self, schema: &TableSchema, key: i64) -> io::Result<()> {
+        let tree = open_index(schema)?;
+        tree.delete(self.records.pages_mut(), key)?;
+        Ok(())
     }
 
     fn require_table(&self, name: &str) -> io::Result<TableSchema> {
@@ -85,10 +267,52 @@ impl Database {
     }
 }
 
+fn open_index(schema: &TableSchema) -> io::Result<BTree> {
+    let root = schema
+        .index_root
+        .ok_or_else(|| io::Error::new(ErrorKind::InvalidData, "missing index root"))?;
+    Ok(BTree::open(root, schema.id))
+}
+
+fn primary_key_value(schema: &TableSchema, values: &[Value]) -> io::Result<Option<i64>> {
+    let Some(index) = schema.primary_key else {
+        return Ok(None);
+    };
+    Ok(Some(require_primary_key(schema, values, index)?))
+}
+
+fn require_primary_key(schema: &TableSchema, values: &[Value], index: usize) -> io::Result<i64> {
+    match values.get(index) {
+        Some(Value::Integer(key)) => Ok(*key),
+        Some(Value::Null) => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!("NULL in primary key column: {}", schema.columns[index].name),
+        )),
+        _ => Err(io::Error::new(
+            ErrorKind::InvalidInput,
+            format!(
+                "type mismatch for column {}: expected INTEGER",
+                schema
+                    .columns
+                    .get(index)
+                    .map(|column| column.name.as_str())
+                    .unwrap_or("?")
+            ),
+        )),
+    }
+}
+
+fn duplicate_key(key: i64) -> io::Error {
+    io::Error::new(
+        ErrorKind::InvalidInput,
+        format!("duplicate primary key: {key}"),
+    )
+}
+
 #[cfg(test)]
 mod tests {
     use super::Database;
-    use crate::catalog::ColumnType;
+    use crate::catalog::{ColumnSpec, ColumnType};
     use crate::page::PageId;
     use crate::record::{RecordId, TableId};
     use crate::row::Value;
@@ -133,9 +357,9 @@ mod tests {
             .create_table(
                 "users",
                 &[
-                    ("id", ColumnType::Integer),
-                    ("name", ColumnType::Text),
-                    ("age", ColumnType::Integer),
+                    ColumnSpec::new("id", ColumnType::Integer),
+                    ColumnSpec::new("name", ColumnType::Text),
+                    ColumnSpec::new("age", ColumnType::Integer),
                 ],
             )
             .unwrap();
@@ -231,9 +455,9 @@ mod tests {
                 .create_table(
                     "users",
                     &[
-                        ("id", ColumnType::Integer),
-                        ("name", ColumnType::Text),
-                        ("age", ColumnType::Integer),
+                        ColumnSpec::new("id", ColumnType::Integer),
+                        ColumnSpec::new("name", ColumnType::Text),
+                        ColumnSpec::new("age", ColumnType::Integer),
                     ],
                 )
                 .unwrap();
@@ -276,13 +500,19 @@ mod tests {
             database
                 .create_table(
                     "users",
-                    &[("id", ColumnType::Integer), ("name", ColumnType::Text)],
+                    &[
+                        ColumnSpec::new("id", ColumnType::Integer),
+                        ColumnSpec::new("name", ColumnType::Text),
+                    ],
                 )
                 .unwrap();
             database
                 .create_table(
                     "posts",
-                    &[("id", ColumnType::Integer), ("title", ColumnType::Text)],
+                    &[
+                        ColumnSpec::new("id", ColumnType::Integer),
+                        ColumnSpec::new("title", ColumnType::Text),
+                    ],
                 )
                 .unwrap();
             user_id = database
@@ -514,5 +744,151 @@ mod tests {
             .unwrap_err();
         assert_eq!(err.kind(), ErrorKind::InvalidData);
         assert_eq!(err.to_string(), "invalid row: 2:0");
+    }
+
+    #[test]
+    fn primary_key_is_unique_and_follows_the_row() {
+        use crate::btree::BTree;
+
+        let db = TempDb::new("pkrows");
+        let mut database = Database::open(db.path()).unwrap();
+        database
+            .create_table(
+                "users",
+                &[
+                    ColumnSpec {
+                        name: "id",
+                        column_type: ColumnType::Integer,
+                        primary_key: true,
+                    },
+                    ColumnSpec::new("name", ColumnType::Text),
+                ],
+            )
+            .unwrap();
+
+        let err = database
+            .insert("users", &[Value::Null, Value::Text("x".to_string())])
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::InvalidInput);
+        assert_eq!(err.to_string(), "NULL in primary key column: id");
+        assert!(database.scan("users").unwrap().is_empty());
+
+        let first = database
+            .insert("users", &[Value::Integer(1), Value::Text("a".repeat(2000))])
+            .unwrap();
+        let err = database
+            .insert_all(
+                "users",
+                &[
+                    vec![Value::Integer(2), Value::Text("Bea".to_string())],
+                    vec![Value::Integer(1), Value::Text("Cara".to_string())],
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "duplicate primary key: 1");
+        assert_eq!(database.scan("users").unwrap().len(), 1);
+
+        let err = database
+            .insert_all(
+                "users",
+                &[
+                    vec![Value::Integer(3), Value::Text("a".to_string())],
+                    vec![Value::Integer(3), Value::Text("b".to_string())],
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "duplicate primary key: 3");
+        assert_eq!(database.scan("users").unwrap().len(), 1);
+
+        let second = database
+            .insert("users", &[Value::Integer(2), Value::Text("b".repeat(2000))])
+            .unwrap();
+        let err = database
+            .update(
+                "users",
+                second,
+                &[Value::Integer(1), Value::Text("b".repeat(2000))],
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "duplicate primary key: 1");
+        assert_eq!(
+            database.get("users", second).unwrap(),
+            vec![Value::Integer(2), Value::Text("b".repeat(2000))]
+        );
+
+        let moved = database
+            .update(
+                "users",
+                first,
+                &[Value::Integer(1), Value::Text("c".repeat(2500))],
+            )
+            .unwrap();
+        assert_ne!(moved, first);
+        let schema = database.table("users").unwrap().clone();
+        let tree = BTree::open(schema.index_root.unwrap(), schema.id);
+        assert_eq!(
+            tree.get(database.records.pages_mut(), 1).unwrap(),
+            Some(moved)
+        );
+        assert_eq!(
+            database.get("users", moved).unwrap()[1],
+            Value::Text("c".repeat(2500))
+        );
+
+        database.delete("users", moved).unwrap();
+        assert!(tree.get(database.records.pages_mut(), 1).unwrap().is_none());
+        let again = database
+            .insert(
+                "users",
+                &[Value::Integer(1), Value::Text("Ada".to_string())],
+            )
+            .unwrap();
+        assert_eq!(
+            tree.get(database.records.pages_mut(), 1).unwrap(),
+            Some(again)
+        );
+
+        let pending = vec![
+            (
+                again,
+                vec![Value::Integer(2), Value::Text("a".repeat(2000))],
+            ),
+            (
+                second,
+                vec![Value::Integer(3), Value::Text("b".repeat(2000))],
+            ),
+        ];
+        database.apply_update("users", &pending).unwrap();
+        let keys: Vec<i64> = tree
+            .scan_all(database.records.pages_mut())
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec![2, 3]);
+
+        let err = database
+            .apply_update(
+                "users",
+                &[
+                    (
+                        again,
+                        vec![Value::Integer(9), Value::Text("a".repeat(2000))],
+                    ),
+                    (
+                        second,
+                        vec![Value::Integer(9), Value::Text("b".repeat(2000))],
+                    ),
+                ],
+            )
+            .unwrap_err();
+        assert_eq!(err.to_string(), "duplicate primary key: 9");
+        let keys: Vec<i64> = tree
+            .scan_all(database.records.pages_mut())
+            .unwrap()
+            .into_iter()
+            .map(|(key, _)| key)
+            .collect();
+        assert_eq!(keys, vec![2, 3]);
     }
 }
