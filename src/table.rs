@@ -24,10 +24,10 @@ impl Database {
     /// mismatch, a NULL primary key, a duplicate primary key, or a row longer
     /// than the maximum record length is [`ErrorKind::InvalidInput`].
     ///
-    /// The buffer pool is flushed before this returns.
+    /// Outside a transaction the buffer pool is flushed before this returns.
+    /// A failed call leaves the table unchanged.
     pub fn insert(&mut self, table: &str, values: &[Value]) -> io::Result<RecordId> {
-        let result = self.insert_unflushed(table, values);
-        self.persist(result)
+        self.in_statement(|db| db.insert_unflushed(table, values))
     }
 
     fn insert_unflushed(&mut self, table: &str, values: &[Value]) -> io::Result<RecordId> {
@@ -39,11 +39,11 @@ impl Database {
     ///
     /// Every row is encoded and, when the table has a primary key, checked
     /// against the index and against the other rows before the first write.
-    /// The error cases match [`Self::insert`]. The buffer pool is flushed
-    /// before this returns.
+    /// The error cases match [`Self::insert`]. Outside a transaction the
+    /// buffer pool is flushed before this returns. A failed call leaves the
+    /// table unchanged.
     pub fn insert_all(&mut self, table: &str, rows: &[Vec<Value>]) -> io::Result<Vec<RecordId>> {
-        let result = self.insert_all_unflushed(table, rows);
-        self.persist(result)
+        self.in_statement(|db| db.insert_all_unflushed(table, rows))
     }
 
     /// Inserts every row without flushing.
@@ -117,10 +117,10 @@ impl Database {
     /// key, or a row longer than the maximum record length is
     /// [`ErrorKind::InvalidInput`].
     ///
-    /// The buffer pool is flushed before this returns.
+    /// Outside a transaction the buffer pool is flushed before this returns.
+    /// A failed call leaves the row unchanged.
     pub fn update(&mut self, table: &str, id: RecordId, values: &[Value]) -> io::Result<RecordId> {
-        let result = self.update_unflushed(table, id, values);
-        self.persist(result)
+        self.in_statement(|db| db.update_unflushed(table, id, values))
     }
 
     fn update_unflushed(
@@ -165,14 +165,14 @@ impl Database {
     /// lets `id = id + 1` succeed. A duplicate or NULL key writes nothing.
     ///
     /// Returns the record id of each row after the write, in `pending` order.
-    /// The buffer pool is flushed before this returns.
+    /// Outside a transaction the buffer pool is flushed before this returns.
+    /// A failed call leaves every row unchanged.
     pub fn apply_update(
         &mut self,
         table: &str,
         pending: &[(RecordId, Vec<Value>)],
     ) -> io::Result<Vec<RecordId>> {
-        let result = self.apply_update_unflushed(table, pending);
-        self.persist(result)
+        self.in_statement(|db| db.apply_update_unflushed(table, pending))
     }
 
     /// Applies `pending` without flushing.
@@ -240,10 +240,10 @@ impl Database {
     /// An unknown table or a missing row is [`ErrorKind::NotFound`]. When the
     /// table has a primary key, the key is removed after the row.
     ///
-    /// The buffer pool is flushed before this returns.
+    /// Outside a transaction the buffer pool is flushed before this returns.
+    /// A failed call leaves the row in place.
     pub fn delete(&mut self, table: &str, id: RecordId) -> io::Result<()> {
-        let result = self.delete_unflushed(table, id);
-        self.persist(result)
+        self.in_statement(|db| db.delete_unflushed(table, id))
     }
 
     /// Deletes one row without flushing.

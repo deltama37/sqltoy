@@ -1,10 +1,10 @@
 //! SQL lexer, parser, and abstract syntax tree.
 //!
-//! [`parse`] accepts `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`, and
-//! `DELETE`, including expressions, `WHERE`, `PRIMARY KEY`, `JOIN`,
-//! `ORDER BY`, and `LIMIT` / `OFFSET`. [`crate::Database::execute`] runs
-//! those statements. Statement [`Display`](std::fmt::Display) text parses
-//! back to the same tree.
+//! [`parse`] accepts `CREATE TABLE`, `INSERT`, `SELECT`, `UPDATE`,
+//! `DELETE`, `BEGIN`, `COMMIT`, and `ROLLBACK`, including expressions,
+//! `WHERE`, `PRIMARY KEY`, `JOIN`, `ORDER BY`, and `LIMIT` / `OFFSET`.
+//! [`crate::Database::execute`] runs those statements. Statement
+//! [`Display`](std::fmt::Display) text parses back to the same tree.
 
 mod ast;
 mod lexer;

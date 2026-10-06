@@ -28,6 +28,12 @@ pub enum QueryResult {
     Updated(u64),
     /// Number of rows deleted.
     Deleted(u64),
+    /// `BEGIN` started a transaction.
+    Begin,
+    /// `COMMIT` persisted the transaction.
+    Commit,
+    /// `ROLLBACK` discarded the transaction.
+    Rollback,
     /// Column names and rows from a `SELECT`.
     Rows {
         /// Output names, in select-list order.
@@ -55,23 +61,49 @@ impl Database {
     /// An unknown table is [`ErrorKind::NotFound`] (`table not found: {name}`).
     /// A bad column, value, or expression is [`ErrorKind::InvalidInput`].
     ///
-    /// The buffer pool is flushed when the statement returns, including when
-    /// it fails. A flush failure after that error is discarded.
+    /// Outside an explicit transaction the buffer pool is flushed when the
+    /// statement succeeds. A failure restores the savepoint taken at the
+    /// start and reloads the catalog, then returns that error. If the
+    /// autocommit flush fails, dirty frames are discarded and the flush
+    /// error is returned; a prefix of the pages may already be on disk.
+    /// `BEGIN`, `COMMIT`, and `ROLLBACK` are not wrapped in a savepoint.
     pub fn execute_statement(&mut self, statement: &Statement) -> io::Result<QueryResult> {
-        let result = match statement {
+        match statement {
+            Statement::Begin => {
+                self.begin()?;
+                Ok(QueryResult::Begin)
+            }
+            Statement::Commit => {
+                self.commit()?;
+                Ok(QueryResult::Commit)
+            }
+            Statement::Rollback => {
+                self.rollback()?;
+                Ok(QueryResult::Rollback)
+            }
+            statement => self.in_statement(|db| db.execute_plan(statement)),
+        }
+    }
+
+    fn execute_plan(&mut self, statement: &Statement) -> io::Result<QueryResult> {
+        match statement {
             Statement::CreateTable(statement) => self.execute_create(statement),
             Statement::Insert(statement) => self.execute_insert(statement),
             Statement::Select(statement) => self.execute_select(statement),
             Statement::Update(statement) => self.execute_update(statement),
             Statement::Delete(statement) => self.execute_delete(statement),
-        };
-        self.persist(result)
+            Statement::Begin | Statement::Commit | Statement::Rollback => Err(io::Error::new(
+                ErrorKind::InvalidInput,
+                "transaction control is not a planned statement",
+            )),
+        }
     }
 
     /// Parses `sql` and runs each statement in order.
     ///
-    /// Stops at the first error. Earlier statements stay applied. The vector
-    /// is empty when `sql` has no statements.
+    /// Stops at the first error. Earlier statements stay applied. An explicit
+    /// transaction stays open when a later statement fails. The vector is
+    /// empty when `sql` has no statements.
     pub fn execute(&mut self, sql: &str) -> io::Result<Vec<QueryResult>> {
         let statements = crate::sql::parse(sql)?;
         let mut results = Vec::with_capacity(statements.len());
@@ -1446,5 +1478,318 @@ mod tests {
             .unwrap()
             .plan
             .describe()
+    }
+
+    fn open_frames(label: &str, frames: usize) -> (TempDb, Database) {
+        let db = TempDb::new(label);
+        let database = Database::open_with_frames(db.path(), frames).unwrap();
+        (db, database)
+    }
+
+    fn index_entries(db: &mut Database, table: &str) -> Vec<(i64, crate::record::RecordId)> {
+        let schema = db.table(table).unwrap().clone();
+        let root = schema.index_root.expect("primary key");
+        let tree = crate::btree::BTree::open(root, schema.id);
+        tree.scan_all(db.records.pages_mut()).unwrap()
+    }
+
+    struct FailGuard;
+
+    impl FailGuard {
+        fn arm(allow: u64) -> Self {
+            crate::buffer::arm_write_failpoint(allow);
+            FailGuard
+        }
+    }
+
+    impl Drop for FailGuard {
+        fn drop(&mut self) {
+            crate::buffer::clear_write_failpoint();
+        }
+    }
+
+    #[test]
+    fn begin_commit_and_rollback() {
+        let (db, mut database) = open("txn");
+        assert!(!database.in_transaction());
+        assert_eq!(
+            exec_err(&mut database, "COMMIT"),
+            (
+                ErrorKind::InvalidInput,
+                "no transaction in progress".to_string()
+            )
+        );
+        assert_eq!(
+            exec_err(&mut database, "ROLLBACK"),
+            (
+                ErrorKind::InvalidInput,
+                "no transaction in progress".to_string()
+            )
+        );
+        assert_eq!(
+            database.commit().unwrap_err().to_string(),
+            "no transaction in progress"
+        );
+
+        assert_eq!(exec(&mut database, "BEGIN"), vec![QueryResult::Begin]);
+        assert!(database.in_transaction());
+        assert_eq!(
+            exec_err(&mut database, "BEGIN TRANSACTION"),
+            (
+                ErrorKind::InvalidInput,
+                "transaction already in progress".to_string()
+            )
+        );
+        assert!(database.in_transaction());
+        exec(
+            &mut database,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        assert_eq!(
+            database.table("users").unwrap().id,
+            crate::record::TableId::FIRST_USER
+        );
+        exec(&mut database, "INSERT INTO users VALUES (1, 'Alice')");
+        let (_, rows) = query(&mut database, "SELECT name FROM users WHERE id = 1");
+        assert_eq!(rows, vec![vec![text("Alice")]]);
+        assert_eq!(exec(&mut database, "ROLLBACK"), vec![QueryResult::Rollback]);
+        assert!(!database.in_transaction());
+        assert!(database.table("users").is_none());
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        assert!(database.table("users").is_none());
+        exec(
+            &mut database,
+            "BEGIN; CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); ROLLBACK",
+        );
+        assert!(database.table("users").is_none());
+        exec(
+            &mut database,
+            "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        assert_eq!(
+            database.table("users").unwrap().id,
+            crate::record::TableId::FIRST_USER
+        );
+        exec(&mut database, "BEGIN");
+        exec(&mut database, "INSERT INTO users VALUES (1, 'Alice')");
+        assert_eq!(exec(&mut database, "COMMIT"), vec![QueryResult::Commit]);
+        assert!(!database.in_transaction());
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        let (_, rows) = query(&mut database, "SELECT id, name FROM users");
+        assert_eq!(rows, vec![vec![int(1), text("Alice")]]);
+
+        database.begin().unwrap();
+        database
+            .insert(
+                "users",
+                &[Value::Integer(2), Value::Text("Bob".to_string())],
+            )
+            .unwrap();
+        database.rollback().unwrap();
+        assert!(database.scan("users").unwrap().len() == 1);
+        database.begin().unwrap();
+        database
+            .create_table(
+                "posts",
+                &[crate::catalog::ColumnSpec::new(
+                    "id",
+                    crate::catalog::ColumnType::Integer,
+                )],
+            )
+            .unwrap();
+        assert!(database.table("posts").is_some());
+        database.rollback().unwrap();
+        assert!(database.table("posts").is_none());
+        database.begin().unwrap();
+        database
+            .insert(
+                "users",
+                &[Value::Integer(3), Value::Text("Cara".to_string())],
+            )
+            .unwrap();
+        database.commit().unwrap();
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        assert!(database.table("posts").is_none());
+        let (_, rows) = query(&mut database, "SELECT id FROM users ORDER BY id");
+        assert_eq!(rows, vec![vec![int(1)], vec![int(3)]]);
+    }
+
+    #[test]
+    fn a_write_failure_rolls_the_statement_back() {
+        let (db, mut database) = open("failpoint");
+        exec(
+            &mut database,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        exec(
+            &mut database,
+            "INSERT INTO t VALUES (1, 'a'), (2, 'b'), (3, 'c')",
+        );
+        let before_rows = database.scan("t").unwrap();
+        let before_index = index_entries(&mut database, "t");
+        let before_file = fs::read(db.path()).unwrap();
+        let _guard = FailGuard::arm(1);
+        let err = database
+            .execute("UPDATE t SET name = 'changed'")
+            .unwrap_err();
+        assert_eq!(err.kind(), ErrorKind::Other);
+        assert_eq!(err.to_string(), "injected write failure");
+        drop(_guard);
+        assert_eq!(database.scan("t").unwrap(), before_rows);
+        assert_eq!(index_entries(&mut database, "t"), before_index);
+        assert_eq!(fs::read(db.path()).unwrap(), before_file);
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        assert_eq!(database.scan("t").unwrap(), before_rows);
+        assert_eq!(index_entries(&mut database, "t"), before_index);
+        assert_eq!(fs::read(db.path()).unwrap(), before_file);
+    }
+
+    #[test]
+    fn a_failed_statement_inside_a_transaction_keeps_earlier_work() {
+        let (db, mut database) = open("txn-fail");
+        exec(
+            &mut database,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        exec(&mut database, "INSERT INTO t VALUES (1, 'a'), (2, 'b')");
+        exec(&mut database, "BEGIN");
+        exec(&mut database, "INSERT INTO t VALUES (3, 'c')");
+        exec(&mut database, "UPDATE t SET name = 'A' WHERE id = 1");
+        let mid_rows = database.scan("t").unwrap();
+        let mid_index = index_entries(&mut database, "t");
+        {
+            let _guard = FailGuard::arm(1);
+            let err = database.execute("UPDATE t SET name = 'Z'").unwrap_err();
+            assert_eq!(err.to_string(), "injected write failure");
+        }
+        assert!(database.in_transaction());
+        assert_eq!(database.scan("t").unwrap(), mid_rows);
+        assert_eq!(index_entries(&mut database, "t"), mid_index);
+        exec(&mut database, "COMMIT");
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        let mut rows = database.scan("t").unwrap();
+        rows.sort_by_key(|(_, values)| match &values[0] {
+            Value::Integer(id) => *id,
+            _ => 0,
+        });
+        let values: Vec<_> = rows.into_iter().map(|(_, values)| values).collect();
+        assert_eq!(
+            values,
+            vec![
+                vec![int(1), text("A")],
+                vec![int(2), text("b")],
+                vec![int(3), text("c")],
+            ]
+        );
+        assert_eq!(
+            index_entries(&mut database, "t")
+                .into_iter()
+                .map(|(key, _)| key)
+                .collect::<Vec<_>>(),
+            vec![1, 2, 3]
+        );
+    }
+
+    #[test]
+    fn drop_without_commit_leaves_the_file_unchanged() {
+        let db = TempDb::new("drop-txn");
+        {
+            let mut database = Database::open(db.path()).unwrap();
+            exec(
+                &mut database,
+                "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+            );
+            exec(&mut database, "INSERT INTO t VALUES (1, 'keep')");
+        }
+        let before = fs::read(db.path()).unwrap();
+        {
+            let mut database = Database::open(db.path()).unwrap();
+            exec(&mut database, "BEGIN");
+            let blob = "x".repeat(3000);
+            for id in 2..=30 {
+                exec(
+                    &mut database,
+                    &format!("INSERT INTO t VALUES ({id}, '{blob}')"),
+                );
+            }
+            assert!(database.in_transaction());
+            assert_eq!(fs::read(db.path()).unwrap(), before);
+        }
+        assert_eq!(fs::metadata(db.path()).unwrap().len(), before.len() as u64);
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        let mut database = Database::open(db.path()).unwrap();
+        let (_, rows) = query(&mut database, "SELECT id FROM t");
+        assert_eq!(rows, vec![vec![int(1)]]);
+    }
+
+    #[test]
+    fn no_steal_overflow_rolls_back_and_commit_shrinks_the_pool() {
+        let (db, mut database) = open_frames("nosteal", 2);
+        exec(
+            &mut database,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        let before = fs::read(db.path()).unwrap();
+        let blob = "z".repeat(3000);
+        exec(&mut database, "BEGIN");
+        for id in 1..=24 {
+            exec(
+                &mut database,
+                &format!("INSERT INTO t VALUES ({id}, '{blob}')"),
+            );
+        }
+        assert!(
+            database.frame_count() >= 20,
+            "frames {}",
+            database.frame_count()
+        );
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        exec(&mut database, "ROLLBACK");
+        assert!(!database.in_transaction());
+        assert!(database.frame_count() <= 2);
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        let (_, rows) = query(&mut database, "SELECT id FROM t");
+        assert!(rows.is_empty());
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        let (_, rows) = query(&mut database, "SELECT id FROM t");
+        assert!(rows.is_empty());
+        assert_eq!(fs::read(db.path()).unwrap(), before);
+        drop(database);
+
+        let (db, mut database) = open_frames("nosteal-commit", 2);
+        exec(
+            &mut database,
+            "CREATE TABLE t (id INTEGER PRIMARY KEY, name TEXT)",
+        );
+        exec(&mut database, "BEGIN");
+        for id in 1..=24 {
+            exec(
+                &mut database,
+                &format!("INSERT INTO t VALUES ({id}, '{blob}')"),
+            );
+        }
+        assert!(database.frame_count() >= 20);
+        exec(&mut database, "COMMIT");
+        assert!(database.frame_count() <= 2);
+        assert!(!database.in_transaction());
+        drop(database);
+
+        let mut database = Database::open(db.path()).unwrap();
+        let (_, rows) = query(&mut database, "SELECT id FROM t ORDER BY id");
+        assert_eq!(rows.len(), 24);
+        assert_eq!(rows[0], vec![int(1)]);
+        assert_eq!(rows[23], vec![int(24)]);
     }
 }

@@ -17,6 +17,8 @@ are in `docs/adr/`:
   `LIMIT` / `OFFSET`, and `JOIN`.
 - ADR-0011 fixes the buffer pool: a fixed number of frames, LRU eviction,
   and a flush at the end of each statement.
+- ADR-0012 fixes transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, statement
+  atomicity, and no-steal rollback.
 
 ## Status
 
@@ -48,12 +50,16 @@ it has enough rows. A comma in `FROM` is a cross join. The buffer pool
 the catalog read and write pages through a fixed set of frames (256 by
 default, at least 1). A read copies a frame out. A write copies into a
 frame and marks it dirty, and does not read the file when the page is not
-cached. The least recently used frame is evicted when the pool is full; a
-dirty victim is written first and not synced. Flush writes every dirty page
-in page-id order and then syncs. A SQL statement flushes once when it
-finishes, including when it fails. `Database::insert`, `update`, `delete`,
-`insert_all`, `apply_update`, and `create_table` flush once at the end as
-well.
+cached. Only a clean frame is evicted. When every frame is dirty the pool
+grows past its configured size and shrinks back after commit or rollback.
+Flush writes every dirty page in page-id order and then syncs. Transactions
+(ADR-0002 step 11, per ADR-0012) are done. `BEGIN` keeps later changes in
+dirty frames until `COMMIT` flushes them or `ROLLBACK` drops them. A
+statement outside a transaction commits itself when it succeeds. A statement
+that fails is undone, including inside an open transaction, which then
+continues. `Database::insert`, `update`, `delete`, `insert_all`,
+`apply_update`, and `create_table` are each one statement. Dropping a
+database does not flush, so an open transaction is lost.
 
 ## Build and test
 
@@ -196,6 +202,76 @@ INSERT 2
   1 | Alice 
 (1 row)
 logical reads: 14, hits: 14, misses: 0, pages written: 4, evictions: 0
+```
+
+## Transactions
+
+`BEGIN` starts a transaction. `COMMIT` writes its dirty pages and syncs.
+`ROLLBACK` drops those pages, so the file is unchanged. A statement that
+fails undoes only its own changes. The prompt is `sqltoy*> ` while a
+transaction is open, when stdin is a terminal. At the end of input, an open
+transaction is rolled back and the REPL prints a warning.
+
+```bash
+cargo run --quiet -- repl /tmp/sqltoy-txn.db <<'EOF'
+CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT);
+BEGIN;
+INSERT INTO users VALUES (1, 'Alice');
+SELECT * FROM users;
+ROLLBACK;
+SELECT * FROM users;
+BEGIN;
+INSERT INTO users VALUES (2, 'Bob');
+COMMIT;
+SELECT * FROM users;
+.quit
+EOF
+```
+
+```text
+CREATE TABLE
+BEGIN
+INSERT 1
+ id | name  
+----+-------
+  1 | Alice 
+(1 row)
+ROLLBACK
+ id | name 
+----+------
+(0 rows)
+BEGIN
+INSERT 1
+COMMIT
+ id | name 
+----+------
+  2 | Bob  
+(1 row)
+```
+
+Leaving `BEGIN` without `COMMIT` rolls the insert back. `sql` does the same.
+Stdout is the statement results. Stderr is the warning:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-txn-open.db "CREATE TABLE t (id INTEGER); BEGIN; INSERT INTO t VALUES (1)"
+```
+
+```text
+CREATE TABLE
+BEGIN
+INSERT 1
+```
+
+```text
+warning: transaction rolled back
+```
+
+A later `SELECT * FROM t` is a new process and prints no rows:
+
+```text
+ id 
+----
+(0 rows)
 ```
 
 ## Storage CLI

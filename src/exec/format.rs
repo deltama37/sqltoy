@@ -12,7 +12,8 @@ use super::executor::QueryResult;
 
 /// Formats `result` as the text the CLI prints, without a trailing newline.
 ///
-/// Status results are `CREATE TABLE`, `INSERT n`, `UPDATE n`, and `DELETE n`.
+/// Status results are `CREATE TABLE`, `INSERT n`, `UPDATE n`, `DELETE n`,
+/// `BEGIN`, `COMMIT`, and `ROLLBACK`.
 /// A select result is a table. Each cell is one leading space, the value
 /// padded to the column width, and one trailing space. Cells are joined with
 /// `|`. The separator under the header is `-` repeated `width + 2` times,
@@ -25,6 +26,9 @@ pub fn format_result(result: &QueryResult) -> String {
         QueryResult::Inserted(count) => format!("INSERT {count}"),
         QueryResult::Updated(count) => format!("UPDATE {count}"),
         QueryResult::Deleted(count) => format!("DELETE {count}"),
+        QueryResult::Begin => "BEGIN".to_string(),
+        QueryResult::Commit => "COMMIT".to_string(),
+        QueryResult::Rollback => "ROLLBACK".to_string(),
         QueryResult::Rows { columns, rows } => format_table(columns, rows),
     }
 }
@@ -145,6 +149,9 @@ mod tests {
         assert_eq!(format_result(&QueryResult::Inserted(1)), "INSERT 1");
         assert_eq!(format_result(&QueryResult::Updated(2)), "UPDATE 2");
         assert_eq!(format_result(&QueryResult::Deleted(3)), "DELETE 3");
+        assert_eq!(format_result(&QueryResult::Begin), "BEGIN");
+        assert_eq!(format_result(&QueryResult::Commit), "COMMIT");
+        assert_eq!(format_result(&QueryResult::Rollback), "ROLLBACK");
     }
 
     #[test]

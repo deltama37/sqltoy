@@ -49,7 +49,9 @@ pub(crate) enum Keyword {
     And,
     As,
     Asc,
+    Begin,
     By,
+    Commit,
     Create,
     Cross,
     Delete,
@@ -73,10 +75,12 @@ pub(crate) enum Keyword {
     Order,
     Outer,
     Primary,
+    Rollback,
     Select,
     Set,
     Table,
     Text,
+    Transaction,
     True,
     Update,
     Values,
@@ -89,7 +93,9 @@ impl Keyword {
             Keyword::And => "AND",
             Keyword::As => "AS",
             Keyword::Asc => "ASC",
+            Keyword::Begin => "BEGIN",
             Keyword::By => "BY",
+            Keyword::Commit => "COMMIT",
             Keyword::Create => "CREATE",
             Keyword::Cross => "CROSS",
             Keyword::Delete => "DELETE",
@@ -113,10 +119,12 @@ impl Keyword {
             Keyword::Order => "ORDER",
             Keyword::Outer => "OUTER",
             Keyword::Primary => "PRIMARY",
+            Keyword::Rollback => "ROLLBACK",
             Keyword::Select => "SELECT",
             Keyword::Set => "SET",
             Keyword::Table => "TABLE",
             Keyword::Text => "TEXT",
+            Keyword::Transaction => "TRANSACTION",
             Keyword::True => "TRUE",
             Keyword::Update => "UPDATE",
             Keyword::Values => "VALUES",
@@ -129,7 +137,9 @@ impl Keyword {
             "and" => Keyword::And,
             "as" => Keyword::As,
             "asc" => Keyword::Asc,
+            "begin" => Keyword::Begin,
             "by" => Keyword::By,
+            "commit" => Keyword::Commit,
             "create" => Keyword::Create,
             "cross" => Keyword::Cross,
             "delete" => Keyword::Delete,
@@ -153,10 +163,12 @@ impl Keyword {
             "order" => Keyword::Order,
             "outer" => Keyword::Outer,
             "primary" => Keyword::Primary,
+            "rollback" => Keyword::Rollback,
             "select" => Keyword::Select,
             "set" => Keyword::Set,
             "table" => Keyword::Table,
             "text" => Keyword::Text,
+            "transaction" => Keyword::Transaction,
             "true" => Keyword::True,
             "update" => Keyword::Update,
             "values" => Keyword::Values,
@@ -566,10 +578,10 @@ mod tests {
 
     #[test]
     fn keywords_are_case_insensitive_and_maximal() {
-        let words = "AND AS ASC BY CREATE CROSS DELETE DESC FALSE FROM INNER INSERT INTEGER INTO IS JOIN KEY LEFT LIMIT NOT NULL OFFSET ON OR ORDER OUTER PRIMARY SELECT SET TABLE TEXT TRUE UPDATE VALUES WHERE";
+        let words = "AND AS ASC BEGIN BY COMMIT CREATE CROSS DELETE DESC FALSE FROM INNER INSERT INTEGER INTO IS JOIN KEY LEFT LIMIT NOT NULL OFFSET ON OR ORDER OUTER PRIMARY ROLLBACK SELECT SET TABLE TEXT TRANSACTION TRUE UPDATE VALUES WHERE";
         for sql in [words, &words.to_ascii_lowercase()] {
             let tokens = tokenize(sql).unwrap();
-            assert_eq!(tokens.len(), 36);
+            assert_eq!(tokens.len(), 40);
             for token in &tokens[..tokens.len() - 1] {
                 assert!(matches!(token.kind, TokenKind::Keyword(_)), "{token:?}");
             }

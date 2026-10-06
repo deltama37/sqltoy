@@ -329,6 +329,29 @@ impl RecordFile {
         self.pages.flush()
     }
 
+    pub(crate) fn set_savepoint(&mut self) -> io::Result<()> {
+        self.pages.set_savepoint()
+    }
+
+    pub(crate) fn rollback_to_savepoint(&mut self) -> io::Result<()> {
+        self.pages.rollback_to_savepoint()
+    }
+
+    pub(crate) fn release_savepoint(&mut self) -> io::Result<()> {
+        self.pages.release_savepoint()
+    }
+
+    /// Drops dirty frames and unflushed allocations.
+    pub(crate) fn discard_dirty(&mut self) -> io::Result<()> {
+        self.pages.discard_dirty()
+    }
+
+    /// Frames held by the pool, including overflow past the configured capacity.
+    #[cfg(test)]
+    pub(crate) fn frame_count(&self) -> usize {
+        self.pages.frame_count()
+    }
+
     /// Buffer pool, so the index can share this file.
     pub(crate) fn pages_mut(&mut self) -> &mut BufferPool {
         &mut self.pages
