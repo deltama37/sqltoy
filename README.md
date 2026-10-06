@@ -19,6 +19,7 @@ are in `docs/adr/`:
   and a flush at the end of each statement.
 - ADR-0012 fixes transactions: `BEGIN` / `COMMIT` / `ROLLBACK`, statement
   atomicity, and no-steal rollback.
+- ADR-0013 fixes the write-ahead log and crash recovery.
 
 ## Status
 
@@ -52,14 +53,20 @@ default, at least 1). A read copies a frame out. A write copies into a
 frame and marks it dirty, and does not read the file when the page is not
 cached. Only a clean frame is evicted. When every frame is dirty the pool
 grows past its configured size and shrinks back after commit or rollback.
-Flush writes every dirty page in page-id order and then syncs. Transactions
+A flush with no dirty pages does not touch the files. Transactions
 (ADR-0002 step 11, per ADR-0012) are done. `BEGIN` keeps later changes in
 dirty frames until `COMMIT` flushes them or `ROLLBACK` drops them. A
 statement outside a transaction commits itself when it succeeds. A statement
 that fails is undone, including inside an open transaction, which then
 continues. `Database::insert`, `update`, `delete`, `insert_all`,
 `apply_update`, and `create_table` are each one statement. Dropping a
-database does not flush, so an open transaction is lost.
+database does not flush, so an open transaction is lost. The WAL and
+recovery (ADR-0002 step 12, per ADR-0013) are done. A commit appends the
+dirty page images and a commit record to `{db}-wal`, syncs that log, writes
+the same pages into the database file, and truncates the log to its header.
+Opening the file replays any commit the log still holds. A torn or corrupt
+tail is ignored, and the log is truncated so the next commit is not appended
+after it.
 
 ## Build and test
 
@@ -273,6 +280,98 @@ A later `SELECT * FROM t` is a new process and prints no rows:
 ----
 (0 rows)
 ```
+
+## WAL and recovery
+
+The database file `db` has a log at `db-wal` in the same directory. A commit
+appends one record per dirty page (the page id and the full page image) and
+then a commit record (the logical page count and how many page records belong
+to this commit). Each record ends with an IEEE CRC-32. The log is synced
+after the commit record. That sync is the commit. The same pages are then
+written to the database file, the database file is synced, and the log is
+truncated to its 16-byte header.
+
+Opening the database reads the log before any query runs. Complete commits
+are written back in log order. The database file is extended or truncated to
+the page count in the last of those commits, then synced, and the log is
+truncated to the header. A record that is cut off, has a bad CRC, has an
+unknown type, or whose commit record names the wrong number of pages stops
+the scan. That tail, and any page images that never got a commit record, are
+discarded. The log is still truncated, so the next commit is not appended
+after the torn bytes. Replaying the same log twice leaves the same file.
+
+`SQLTOY_CRASH_AT` aborts the process at one point in that protocol:
+`wal-partial` (after the first page record, before the commit record),
+`before-wal-sync` (commit record written, log not synced), `after-wal-sync`
+(log synced, database file not yet written), `mid-checkpoint` (first database
+page written), and `before-wal-truncate` (database file synced, log not yet
+truncated). The shell reports the abort. Status 134 is SIGABRT.
+
+A crash before the commit record does not keep the insert. Create the table
+first:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-wal.db "CREATE TABLE users (id INTEGER PRIMARY KEY, name TEXT); INSERT INTO users VALUES (1, 'Ann'), (2, 'Bob')"
+```
+
+```text
+CREATE TABLE
+INSERT 2
+```
+
+Abort during the next insert. The shell reports `Aborted` and the status is
+134:
+
+```bash
+SQLTOY_CRASH_AT=wal-partial cargo run --quiet -- sql /tmp/sqltoy-wal.db "INSERT INTO users VALUES (3, 'Cam')"
+```
+
+```text
+Aborted
+```
+
+The next process prints the rows from before that crash:
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-wal.db "SELECT * FROM users"
+```
+
+```text
+ id | name 
+----+------
+  1 | Ann  
+  2 | Bob  
+(2 rows)
+```
+
+A crash after the log sync keeps the insert. Recovery replays it, and the
+log is the 16-byte header again:
+
+```bash
+SQLTOY_CRASH_AT=after-wal-sync cargo run --quiet -- sql /tmp/sqltoy-wal.db "INSERT INTO users VALUES (3, 'Cam')"
+```
+
+```text
+Aborted
+```
+
+```bash
+cargo run --quiet -- sql /tmp/sqltoy-wal.db "SELECT * FROM users"
+```
+
+```text
+ id | name 
+----+------
+  1 | Ann  
+  2 | Bob  
+  3 | Cam  
+(3 rows)
+```
+
+`before-wal-sync` can go either way: the commit record is in the kernel cache
+but was not synced, so a later open sees every change from that commit or
+none of them. `after-wal-sync`, `mid-checkpoint`, and `before-wal-truncate`
+all show the committed state.
 
 ## Storage CLI
 

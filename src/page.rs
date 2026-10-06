@@ -166,6 +166,15 @@ impl PageManager {
         self.storage.sync()
     }
 
+    /// Sets the database file length in bytes.
+    ///
+    /// Recovery uses this so the file matches the page count stored in a WAL
+    /// commit. Extending fills the new bytes with zeros. Truncating drops the
+    /// tail. The new length is durable after [`Self::sync`].
+    pub fn set_len(&mut self, len: u64) -> io::Result<()> {
+        self.storage.set_len(len)
+    }
+
     /// Format version recorded in the header page.
     pub fn format_version(&mut self) -> io::Result<u32> {
         let page = self.read_page(PageId(0))?;
@@ -262,6 +271,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -273,6 +283,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 
@@ -436,6 +447,23 @@ mod tests {
         let mut pages = PageManager::open(db.path()).unwrap();
         assert_eq!(pages.page_count().unwrap(), 3);
         assert_eq!(pages.read_page(PageId(2)).unwrap().data()[0], 7);
+    }
+
+    #[test]
+    fn set_len_extends_and_truncates() {
+        let db = TempDb::new("setlen");
+        let mut pages = PageManager::open(db.path()).unwrap();
+        pages.set_len((PAGE_SIZE * 3) as u64).unwrap();
+        assert_eq!(pages.page_count().unwrap(), 3);
+        let extended = pages.read_page(PageId(2)).unwrap();
+        assert!(extended.data().iter().all(|byte| *byte == 0));
+        pages.set_len(PAGE_SIZE as u64).unwrap();
+        pages.sync().unwrap();
+        assert_eq!(pages.page_count().unwrap(), 1);
+        drop(pages);
+
+        let pages = PageManager::open(db.path()).unwrap();
+        assert_eq!(pages.page_count().unwrap(), 1);
     }
 
     fn error_of<T>(result: std::io::Result<T>) -> std::io::Error {

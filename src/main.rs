@@ -358,6 +358,7 @@ fn run_sql(db: &mut Database, sql: &str) -> io::Result<()> {
     for statement in sqltoy::sql::parse(sql)? {
         let result = db.execute_statement(&statement)?;
         println!("{}", format_result(&result));
+        io::stdout().flush()?;
     }
     Ok(())
 }
@@ -435,7 +436,10 @@ fn run_buffer(db: &mut Database, sql: &str) {
     };
     for statement in &statements {
         match db.execute_statement(statement) {
-            Ok(result) => println!("{}", format_result(&result)),
+            Ok(result) => {
+                println!("{}", format_result(&result));
+                let _ = io::stdout().flush();
+            }
             Err(err) => {
                 eprintln!("error: {err}");
                 return;

@@ -133,6 +133,7 @@ fn unique_temp_path(label: &str) -> PathBuf {
     let mut path = std::env::temp_dir();
     path.push(format!("sqltoy-record-{label}-{}-{nanos}", process::id()));
     let _ = fs::remove_file(&path);
+    let _ = fs::remove_file(sqltoy::wal_path(&path));
     path
 }
 
@@ -141,5 +142,6 @@ struct TempFile<'a>(&'a PathBuf);
 impl Drop for TempFile<'_> {
     fn drop(&mut self) {
         let _ = fs::remove_file(self.0);
+        let _ = fs::remove_file(sqltoy::wal_path(self.0));
     }
 }

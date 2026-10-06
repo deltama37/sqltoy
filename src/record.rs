@@ -7,7 +7,8 @@
 //!
 //! Mutations update a [`crate::buffer::BufferPool`] and do not sync a single
 //! page on their own. [`RecordFile::open`] flushes after each insert, update,
-//! and delete so the record CLI stays durable across processes.
+//! and delete so the record CLI stays durable across processes. That flush is
+//! the WAL commit.
 //! [`crate::catalog::Database`] opens with [`RecordFile::open_pooled`], which
 //! leaves that flush off, and syncs once at the end of a statement or a
 //! public row call.
@@ -324,7 +325,7 @@ impl RecordFile {
         self.pages.stats()
     }
 
-    /// Writes dirty pages and syncs the file.
+    /// Commits dirty pages through the WAL and checkpoints the file.
     pub fn flush(&mut self) -> io::Result<()> {
         self.pages.flush()
     }
@@ -414,6 +415,7 @@ mod tests {
             let mut path = temp_dir();
             path.push(format!("sqltoy-{label}-{}-{nanos}", process::id()));
             let _ = fs::remove_file(&path);
+            let _ = fs::remove_file(crate::wal::wal_path(&path));
             TempDb { path }
         }
 
@@ -425,6 +427,7 @@ mod tests {
     impl Drop for TempDb {
         fn drop(&mut self) {
             let _ = fs::remove_file(&self.path);
+            let _ = fs::remove_file(crate::wal::wal_path(&self.path));
         }
     }
 
